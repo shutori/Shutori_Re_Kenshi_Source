@@ -1,7 +1,9 @@
 #include "PrisonerUtil.h"
 
 #include "ArenaIngress.h"
+#include "ArenaMedical.h"
 #include "FightStarter.h"
+#include "FrameCadencePolicy.h"
 #include "PrisonerMatchLogic.h"
 #include "PrisonerUtilInternal.h"
 #include "SparSession.h"
@@ -12,7 +14,7 @@
 #include <limits>
 #include <windows.h>
 
-#include <Debug.h>
+#include "PGLog.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4091)
@@ -27,6 +29,7 @@
 #include <kenshi/util/hand.h>
 #include <kenshi/util/lektor.h>
 #include <ogre/OgreVector3.h>
+#include <ogre/OgreLogManager.h>
 #pragma warning(pop)
 
 #ifndef NULL
@@ -66,11 +69,20 @@ namespace PrisonerUtil
             bool newlyReleased;
             UseableStuff* returnCage;
             Building* returnCageBuilding;
+            hand returnCageHand;
+            hand prisonerHand;
+            hand handlerHand;
+            bool lockPending;
+            bool lockOrderIssued;
+            DWORD lockStartedAt;
             bool returnPending;
             bool returnEscorting;
             bool returnCarrying;
             bool returnPickedUp;
+            bool returnTreating;
             float returnElapsed;
+            bool ringsideTreating;
+            float ringsideTreatElapsed;
         };
 
         static std::vector<Character*> g_rosterPrisoners;
@@ -81,17 +93,32 @@ namespace PrisonerUtil
         static bool g_matchHasPrisoner = false;
         static bool g_returning = false;
         static bool g_unlocking = false;
+        static bool g_cageReturnFailed = false;
+        static std::string g_cageReturnStatus;
         static bool g_handlerStatesRemembered = false;
         static DWORD g_returnLastTick = 0;
         static DWORD g_unlockLastTick = 0;
+        static DWORD g_ringsideAidLastTick = 0;
+        static DWORD g_matchUpkeepLastTick = 0;
+        static float g_protectionElapsedSec = 0.0f;
+        static float g_handlerElapsedSec = 0.0f;
+        static bool g_protectionImmediate = false;
 
         static const int kSphereSearchMax = 512;
-        static const float kReturnArriveRadius = 120.0f;
+        // The building origin can be a long way from the cage's actual lock point.
+        // Only finalise the native prison assignment once the prisoner/handler is
+        // genuinely at the cage; otherwise Kenshi can leave the prisoner alongside it.
+        static const float kReturnArriveRadius = 36.0f;
         static const float kReturnTimeoutSec = 60.0f;
+        static const DWORD kLockTimeoutMs = 30000;
         static const float kUnlockArriveRadius = 120.0f;
         static const float kUnlockHoldSec = 0.45f;
         static const float kUnlockTimeoutSec = 45.0f;
         static const float kCarryPickupRetrySec = 2.5f;
+        static const float kTreatmentTimeoutSec = 20.0f;
+        static const float kTreatmentRetrySec = 3.0f;
+        static const float kProtectionIntervalSec = 0.10f;
+        static const float kHandlerReinforceIntervalSec = 0.25f;
         static const float kHandlerSideOffset = 28.0f;
         static const float kHandlerLeadOffset = 8.0f;
         static const char* kPrisonerFightLines[] = {
@@ -104,6 +131,23 @@ namespace PrisonerUtil
             "Let's get this over with.",
             "This should be interesting."
         };
+
+        float AdvanceMatchUpkeepClock()
+        {
+            const DWORD now = GetTickCount();
+            const float dt = g_matchUpkeepLastTick == 0 ? 0.0f :
+                static_cast<float>(now - g_matchUpkeepLastTick) / 1000.0f;
+            g_matchUpkeepLastTick = now;
+            return dt > 1.0f ? 1.0f : dt;
+        }
+
+        void ResetMatchUpkeep()
+        {
+            g_matchUpkeepLastTick = 0;
+            FrameCadencePolicy::Reset(g_protectionElapsedSec);
+            FrameCadencePolicy::Reset(g_handlerElapsedSec);
+            g_protectionImmediate = false;
+        }
 
         float HorizontalDistSq(const Ogre::Vector3& a, const Ogre::Vector3& b)
         {
@@ -233,7 +277,7 @@ namespace PrisonerUtil
                     buf,
                     "Proving Grounds: cage discovery ownership=%d sphere=skipped (no world)",
                     static_cast<int>(cagesOut.size()));
-                DebugLog(buf);
+                PGLog::Debug(buf);
                 return;
             }
 
@@ -282,7 +326,7 @@ namespace PrisonerUtil
                 static_cast<int>(ownedCages.size()),
                 sphereBuildings,
                 playerBuildings);
-            DebugLog(buf);
+            PGLog::Debug(buf);
         }
 
         // Most reliable roster source: characters already marked IN_PRISON near registry.
@@ -351,7 +395,7 @@ namespace PrisonerUtil
                 "Proving Grounds: imprisoned scan hits=%d kept=%d",
                 imprisonedHits,
                 static_cast<int>(out.size()));
-            DebugLog(buf);
+            PGLog::Debug(buf);
         }
 
         bool IsCageFree(UseableStuff* useable)
@@ -412,6 +456,56 @@ namespace PrisonerUtil
             c->setDestination(loc, false);
         }
 
+        void IssueRun(Character* c, const Ogre::Vector3& loc)
+        {
+            IssueMove(c, loc);
+            if (!c || !c->isValid())
+                return;
+            CharMovement* movement = c->getMovement();
+            if (movement)
+            {
+                movement->setDesiredSpeedOrders(RUN);
+                movement->setDesiredSpeed(RUN);
+            }
+        }
+
+        void ClearHandlerOrderQueue(Character* handler)
+        {
+            if (!handler || !handler->isValid())
+                return;
+            const Ogre::Vector3 pos = handler->getPosition();
+            handler->addOrder(NULL, MOVE_CUS_ORDERED, NULL, false, true, pos);
+            handler->removeJob(MOVE_CUS_ORDERED);
+        }
+
+        Ogre::Vector3 HandlerTransitTarget(
+            const MatchEntry& entry,
+            const Ogre::Vector3& destination,
+            size_t entryIndex)
+        {
+            Ogre::Vector3 origin = destination;
+            if (entry.cageUseable)
+                origin = static_cast<Building*>(entry.cageUseable)->getPosition();
+            else if (entry.prisoner && entry.prisoner->isValid())
+                origin = entry.prisoner->getPosition();
+            Ogre::Vector3 direction = destination - origin;
+            direction.y = 0.0f;
+            const float lenSq = direction.x * direction.x + direction.z * direction.z;
+            Ogre::Vector3 side(1.0f, 0.0f, 0.0f);
+            if (lenSq > 1.0f)
+            {
+                const float invLen = 1.0f / sqrtf(lenSq);
+                direction.x *= invLen;
+                direction.z *= invLen;
+                side.x = -direction.z;
+                side.z = direction.x;
+            }
+            if ((entryIndex % 2) != 0)
+                side = -side;
+            return destination - (direction * kHandlerLeadOffset) +
+                (side * kHandlerSideOffset);
+        }
+
         void ClearParkOrders(Character* c)
         {
             if (!c || !c->isValid())
@@ -424,6 +518,19 @@ namespace PrisonerUtil
         {
             if (!c || !c->isValid() || c->isDead())
                 return;
+            // Drop lingering sit-around / job AI before freezing in place.
+            c->clearAllAIGoals();
+            c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, true);
+            c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, true);
+            c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, false);
+            c->reThinkCurrentAIAction();
+        }
+
+        void ReinforceParkOrders(Character* c)
+        {
+            if (!c || !c->isValid() || c->isDead())
+                return;
+            // Re-assert hold without wiping medical / escort AI mid-match.
             c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, true);
             c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, true);
             c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, false);
@@ -434,29 +541,206 @@ namespace PrisonerUtil
             return c && c->isValid() && !c->isDead() && !c->isUnconcious();
         }
 
+        void IssueLiftOrder(Character* handler, Character* prisoner);
+
+        typedef bool (*NativeLockPredicate)(AI*, const hand&, const Ogre::Vector3&);
+
+        NativeLockPredicate GetNativeLockVerifier()
+        {
+            // The SDK omits this declaration. The KenshiLib export preserves the
+            // native predicate, including lock strength and broken-lock checks.
+            static NativeLockPredicate verify = NULL;
+            if (!verify)
+            {
+                HMODULE library = GetModuleHandleA("KenshiLib.dll");
+                if (library)
+                    verify = reinterpret_cast<NativeLockPredicate>(GetProcAddress(
+                        library, "?isDoorLocked@AI@@QEAA_NAEBVhand@@AEBVVector3@Ogre@@@Z"));
+            }
+            return verify;
+        }
+
+        void ReportCageReturnFailure(Character* prisoner, const char* reason)
+        {
+            std::string message = "Could not secure ";
+            message += prisoner && prisoner->isValid() ? prisoner->getName() : "prisoner";
+            message += ": ";
+            message += reason;
+            g_cageReturnFailed = true;
+            if (!g_cageReturnStatus.empty()) g_cageReturnStatus += "\n";
+            g_cageReturnStatus += message;
+            PGLog::Debug(("Proving Grounds: " + message).c_str());
+            if (ou) ou->showPlayerAMessage(message, true);
+        }
+
+        const char* CageLockFailureReason(PrisonerMatchLogic::CageLockAction action)
+        {
+            using namespace PrisonerMatchLogic;
+            switch (action)
+            {
+            case CageLockMissingDestination: return "destination cage or pole is missing or destroyed";
+            case CageLockWrongOccupant: return "destination does not contain the expected prisoner";
+            case CageLockMissingLock: return "destination has no operable lock";
+            case CageLockBroken: return "destination cage or pole is broken";
+            case CageLockNoVerifier: return "native cage lock verification is unavailable";
+            case CageLockNoHandler: return "no conscious handler can lock the destination";
+            case CageLockOrderFailed: return "native cage lock order was rejected";
+            case CageLockTimedOut: return "native lock did not engage before timeout (blocked or broken lock)";
+            default: return "native cage lock failed";
+            }
+        }
+
+        // Resolves each handle afresh so destroyed/unloaded furniture or actors
+        // cannot leave a pending operation dereferencing its old raw pointer.
+        void ResolveReturnReferences(MatchEntry& entry)
+        {
+            entry.prisoner = entry.prisonerHand.getCharacter();
+            entry.handler = entry.handlerHand.getCharacter();
+            entry.returnCageBuilding = entry.returnCageHand.getBuilding();
+            Building* building = entry.returnCageBuilding;
+            if (building && (!building->isValid() || building->destroyed)) building = NULL;
+            entry.returnCageBuilding = building;
+            entry.returnCage = building ? AsUseableCage(building) : NULL;
+        }
+
+        bool SecureReturnedPrisoner(MatchEntry& returning, std::string& statusOut)
+        {
+            using namespace PrisonerMatchLogic;
+            statusOut.clear();
+            MatchEntry* entry = &returning;
+            Character* prisoner = entry->prisoner;
+            UseableStuff* cage = entry->returnCage;
+            Character* handler = entry->handler;
+            CageLockObservation observation = {};
+            observation.destinationValid = cage && cage->isValid() && !cage->destroyed;
+            observation.correctOccupant = observation.destinationValid && prisoner &&
+                prisoner->isValid() && !prisoner->isDead() &&
+                cage->getOccupant().getCharacter() == prisoner;
+            observation.hasLock = observation.destinationValid && cage->getDoorLock() != NULL;
+            observation.broken = observation.destinationValid && cage->isBroken();
+            observation.handlerAvailable = IsConsciousPrisoner(handler) && handler->getAI();
+            NativeLockPredicate verify = GetNativeLockVerifier();
+            AI* ai = observation.handlerAvailable ? handler->getAI() :
+                (prisoner && prisoner->isValid() ? prisoner->getAI() : NULL);
+            observation.verifierAvailable = verify && ai;
+            observation.locked = observation.destinationValid && observation.hasLock &&
+                observation.verifierAvailable &&
+                verify(ai, entry->returnCageHand, cage->getPosition());
+            observation.orderIssued = entry->lockOrderIssued;
+            observation.timedOut = GetTickCount() - entry->lockStartedAt >= kLockTimeoutMs;
+            CageLockAction action = ChooseCageLockAction(observation);
+            if (action == CageLockIssueOrder)
+            {
+                // addOrder copies SUBJECT into the queued hand (native 0x5D1799).
+                // Native factory 0x32EB90 maps LOCK_DOOR (0x4D) to Task_LockDoor;
+                // its update 0x337630 resolves that building and calls its virtual
+                // getDoorLock. HERE predicates use the actor's current building.
+                // Never send a null/broad cage target.
+                ClearParkOrders(handler);
+                observation.orderRejected = handler->checkPlayerOrderForProblems(LOCK_DOOR, cage);
+                if (observation.orderRejected)
+                    action = ChooseCageLockAction(observation);
+                else
+                {
+                    handler->addOrder(cage, LOCK_DOOR, cage, false, true, cage->getPosition());
+                    entry->lockOrderIssued = true;
+                    action = CageLockWait;
+                }
+            }
+            if (action == CageLockSecured)
+                return true;
+            if (action != CageLockWait)
+                statusOut = CageLockFailureReason(action);
+            return false;
+        }
+
+        void AdvanceCageLock(MatchEntry& entry)
+        {
+            ResolveReturnReferences(entry);
+            std::string failure;
+            const bool secured = SecureReturnedPrisoner(entry, failure);
+            if (secured || !failure.empty())
+            {
+                entry.lockPending = false;
+                entry.returnPending = false;
+                if (entry.lockOrderIssued) ClearHandlerOrderQueue(entry.handler);
+                if (!failure.empty()) ReportCageReturnFailure(entry.prisoner, failure.c_str());
+            }
+        }
+
         void FinishCageEntry(MatchEntry& entry)
         {
+            if (entry.lockPending) return;
+            ResolveReturnReferences(entry);
             Character* prisoner = entry.prisoner;
             Character* handler = entry.handler;
             UseableStuff* cage = entry.returnCage;
 
-            if (handler && handler->isValid() && handler->isCarryingSomething)
-                handler->dropCarriedObject(false, false);
+            if (handler && handler->isValid())
+            {
+                if (handler->isCarryingSomething)
+                    handler->dropCarriedObject(false, false);
+                ClearHandlerOrderQueue(handler);
+            }
 
-            if (prisoner && prisoner->isValid() && !prisoner->isDead() && cage)
+            // Never replace a different live occupant during emergency placement.
+            const bool canPlace = cage && !cage->isBroken() &&
+                (IsCageFree(cage) || cage->getOccupant().getCharacter() == prisoner);
+            if (prisoner && prisoner->isValid() && !prisoner->isDead() && canPlace)
             {
                 prisoner->setPrisonMode(true, cage);
-                if (entry.wasChained || prisoner->isSlave() == IS_SLAVE)
-                {
-                    prisoner->setChainedMode(
-                        true,
-                        hand(static_cast<RootObjectBase*>(prisoner)));
-                }
+                prisoner->setChainedMode(true, hand(static_cast<RootObjectBase*>(prisoner)));
             }
-            entry.returnPending = false;
             entry.returnEscorting = false;
             entry.returnCarrying = false;
             entry.returnPickedUp = false;
+            entry.returnTreating = false;
+            entry.returnPending = true;
+            entry.lockPending = true;
+            entry.lockOrderIssued = false;
+            entry.lockStartedAt = GetTickCount();
+            AdvanceCageLock(entry);
+        }
+
+        void BeginReturnMovement(MatchEntry& entry)
+        {
+            Character* prisoner = entry.prisoner;
+            Character* handler = entry.handler;
+            entry.returnTreating = false;
+            entry.returnElapsed = 0.0f;
+
+            if (prisoner && prisoner->isValid())
+            {
+                prisoner->clearAllAIGoals();
+                prisoner->reThinkCurrentAIAction();
+            }
+            if (handler && handler->isValid() && !handler->isDead())
+            {
+                handler->clearAllAIGoals();
+                handler->reThinkCurrentAIAction();
+            }
+
+            if (entry.returnEscorting)
+            {
+                if (entry.returnCageBuilding)
+                {
+                    const Ogre::Vector3 cagePos = entry.returnCageBuilding->getPosition();
+                    IssueRun(prisoner, cagePos);
+                    IssueRun(handler, HandlerTransitTarget(entry, cagePos, 0));
+                }
+                return;
+            }
+
+            if (entry.returnCarrying)
+            {
+                if (handler && handler->isValid() && !handler->isDead())
+                    IssueLiftOrder(handler, prisoner);
+                else
+                    FinishCageEntry(entry);
+                return;
+            }
+
+            FinishCageEntry(entry);
         }
 
         void ReleasePrisonerFromCage(MatchEntry& entry)
@@ -466,6 +750,7 @@ namespace PrisonerUtil
                 return;
 
             entry.wasChained = prisoner->isChainedMode();
+            ClearHandlerOrderQueue(entry.handler);
             prisoner->setPrisonMode(false, NULL);
             if (entry.wasChained)
                 prisoner->setChainedMode(false, hand(static_cast<RootObjectBase*>(prisoner)));
@@ -473,6 +758,7 @@ namespace PrisonerUtil
             entry.released = true;
             entry.unlockPending = false;
             entry.newlyReleased = true;
+            g_protectionImmediate = true;
 
             const int lineCount = static_cast<int>(
                 sizeof(kPrisonerFightLines) / sizeof(kPrisonerFightLines[0]));
@@ -507,6 +793,7 @@ namespace PrisonerUtil
             outsider->clearTempEnemyStatus(prisoner);
             prisoner->clearTempEnemyStatus(outsider);
             outsider->removeJob(FOCUSED_MELEE_ATTACK);
+            outsider->removeJob(UNPROVOKED_FOCUSED_MELEE_ATTACK);
             hand target = outsider->getAttackTarget();
             if (target.isValid() && target.getCharacter() == prisoner)
                 outsider->endCombatMode();
@@ -527,12 +814,42 @@ namespace PrisonerUtil
             entry.newlyReleased = false;
             entry.returnCage = NULL;
             entry.returnCageBuilding = NULL;
+            entry.lockPending = false;
+            entry.lockOrderIssued = false;
+            entry.lockStartedAt = 0;
             entry.returnPending = false;
             entry.returnEscorting = false;
             entry.returnCarrying = false;
             entry.returnPickedUp = false;
+            entry.returnTreating = false;
             entry.returnElapsed = 0.0f;
+            entry.ringsideTreating = false;
+            entry.ringsideTreatElapsed = 0.0f;
         }
+    }
+
+    bool HasRuntimeActivity()
+    {
+        return g_unlocking || g_returning || !g_matchEntries.empty();
+    }
+
+    void AbandonWorldState()
+    {
+        g_cageReturnFailed = false;
+        g_cageReturnStatus.clear();
+        g_rosterPrisoners.clear();
+        g_nearbyCages.clear();
+        g_matchEntries.clear();
+        g_matchHandlers.clear();
+        g_matchPrisonersScratch.clear();
+        g_matchHasPrisoner = false;
+        g_returning = false;
+        g_unlocking = false;
+        g_handlerStatesRemembered = false;
+        g_returnLastTick = 0;
+        g_unlockLastTick = 0;
+        g_ringsideAidLastTick = 0;
+        ResetMatchUpkeep();
     }
 
     void CollectNearbyCagePrisoners(Building* registry, std::vector<Character*>& out)
@@ -543,7 +860,7 @@ namespace PrisonerUtil
 
         if (!registry)
         {
-            DebugLog("Proving Grounds: prisoner collect skipped — no bound registry");
+            PGLog::Debug("Proving Grounds: prisoner collect skipped — no bound registry");
             return;
         }
 
@@ -581,7 +898,7 @@ namespace PrisonerUtil
             "Proving Grounds: prisoner roster size=%d cages=%d",
             static_cast<int>(out.size()),
             static_cast<int>(g_nearbyCages.size()));
-        DebugLog(buf);
+        PGLog::Debug(buf);
     }
 
     bool IsRosterPrisoner(Character* c)
@@ -666,7 +983,14 @@ namespace PrisonerUtil
         const std::vector<Character*>& handlerCandidates,
         std::string& statusOut)
     {
+        if (g_returning || HasPendingCageLocks())
+        {
+            statusOut = "Wait for prisoner return and cage locking to finish";
+            return false;
+        }
         ClearMatchState();
+        g_cageReturnFailed = false;
+        g_cageReturnStatus.clear();
 
         if (handlerCandidates.size() < prisonerFighters.size())
         {
@@ -707,6 +1031,8 @@ namespace PrisonerUtil
             entry.cageUseable = cage;
             entry.cageHand = hand(static_cast<RootObjectBase*>(cage));
             entry.handler = handlerCandidates[i];
+            entry.prisonerHand = hand(static_cast<RootObjectBase*>(prisoner));
+            entry.handlerHand = hand(static_cast<RootObjectBase*>(entry.handler));
             entry.originalCageIndex = FindCageIndex(cage, cages);
             planned.push_back(entry);
         }
@@ -741,6 +1067,17 @@ namespace PrisonerUtil
         return g_rosterPrisoners;
     }
 
+    void ForgetRosterPrisoner(Character* prisoner)
+    {
+        for (size_t i = 0; i < g_rosterPrisoners.size(); )
+        {
+            if (g_rosterPrisoners[i] == prisoner)
+                g_rosterPrisoners.erase(g_rosterPrisoners.begin() + i);
+            else
+                ++i;
+        }
+    }
+
     bool MatchIncludesPrisoner()
     {
         return g_matchHasPrisoner;
@@ -770,26 +1107,6 @@ namespace PrisonerUtil
         return true;
     }
 
-    bool AllMatchHandlersReady(float maxDistanceFromPrisoner)
-    {
-        if (g_matchEntries.empty())
-            return true;
-        const float maxDistanceSq = maxDistanceFromPrisoner * maxDistanceFromPrisoner;
-        for (size_t i = 0; i < g_matchEntries.size(); ++i)
-        {
-            const MatchEntry& entry = g_matchEntries[i];
-            if (!entry.released)
-                return false;
-            Character* prisoner = entry.prisoner;
-            Character* handler = entry.handler;
-            if (!prisoner || !prisoner->isValid() ||
-                !handler || !handler->isValid() || handler->isDead())
-                return false;
-            if (HorizontalDistSq(prisoner->getPosition(), handler->getPosition()) > maxDistanceSq)
-                return false;
-        }
-        return true;
-    }
     void BeginHandlerUnlocks()
     {
         if (g_matchEntries.empty())
@@ -919,7 +1236,7 @@ namespace PrisonerUtil
         return false;
     }
 
-    void EscortHandlerBesidePrisoner(
+    void SendPairToArena(
         Character* prisoner, const Ogre::Vector3& prisonerTarget)
     {
         if (!prisoner || !prisoner->isValid())
@@ -928,39 +1245,13 @@ namespace PrisonerUtil
         for (size_t i = 0; i < g_matchEntries.size(); ++i)
         {
             MatchEntry& entry = g_matchEntries[i];
-            if (entry.prisoner != prisoner)
+            if (entry.prisoner != prisoner || !entry.released)
                 continue;
 
+            IssueRun(prisoner, prisonerTarget);
             Character* handler = entry.handler;
-            if (!handler || !handler->isValid() || handler->isDead())
-                return;
-
-            Ogre::Vector3 direction = prisonerTarget - prisoner->getPosition();
-            direction.y = 0.0f;
-            const float lenSq = (direction.x * direction.x) +
-                (direction.z * direction.z);
-            Ogre::Vector3 side(1.0f, 0.0f, 0.0f);
-            if (lenSq > 1.0f)
-            {
-                const float invLen = 1.0f / sqrtf(lenSq);
-                direction.x *= invLen;
-                direction.z *= invLen;
-                side.x = -direction.z;
-                side.z = direction.x;
-            }
-            if ((i % 2) != 0)
-                side = -side;
-
-            const Ogre::Vector3 escortTarget = prisoner->getPosition() +
-                (direction * kHandlerLeadOffset) +
-                (side * kHandlerSideOffset);
-            IssueMove(handler, escortTarget);
-            CharMovement* movement = handler->getMovement();
-            if (movement)
-            {
-                movement->setDesiredSpeedOrders(RUN);
-                movement->setDesiredSpeed(RUN);
-            }
+            if (handler && handler->isValid() && !handler->isDead())
+                IssueRun(handler, HandlerTransitTarget(entry, prisonerTarget, i));
             return;
         }
     }
@@ -973,6 +1264,11 @@ namespace PrisonerUtil
         for (size_t i = 0; i < g_matchEntries.size(); ++i)
         {
             MatchEntry& entry = g_matchEntries[i];
+            if (g_returning)
+            {
+                ResolveReturnReferences(entry);
+                if (entry.lockPending || !entry.returnPending) continue;
+            }
             Character* prisoner = entry.prisoner;
             if (!prisoner || !prisoner->isValid() || prisoner->isDead())
                 continue;
@@ -996,6 +1292,7 @@ namespace PrisonerUtil
                 {
                     prisoner->clearTempEnemyStatus(target);
                     prisoner->removeJob(FOCUSED_MELEE_ATTACK);
+                    prisoner->removeJob(UNPROVOKED_FOCUSED_MELEE_ATTACK);
                     prisoner->endCombatMode();
                 }
             }
@@ -1011,17 +1308,113 @@ namespace PrisonerUtil
         }
     }
 
+    void TickRingsideAid()
+    {
+        if (!SparSession::IsActive() || !g_matchHasPrisoner ||
+            !ArenaMedical::ShouldStabilizePrisoner(ArenaMedical::GetProtocol()))
+        {
+            g_ringsideAidLastTick = 0;
+            return;
+        }
+
+        const DWORD now = GetTickCount();
+        float dt = g_ringsideAidLastTick == 0 ? 0.0f :
+            static_cast<float>(now - g_ringsideAidLastTick) / 1000.0f;
+        g_ringsideAidLastTick = now;
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 1.0f) dt = 1.0f;
+
+        for (size_t i = 0; i < g_matchEntries.size(); ++i)
+        {
+            MatchEntry& entry = g_matchEntries[i];
+            Character* prisoner = entry.prisoner;
+            Character* handler = entry.handler;
+            const bool eligible = prisoner && prisoner->isValid() &&
+                !prisoner->isDead() && SparSession::IsEliminated(prisoner) &&
+                ArenaMedical::NeedsStabilization(prisoner);
+            if (!eligible)
+            {
+                if (entry.ringsideTreating)
+                {
+                    entry.ringsideTreating = false;
+                    entry.ringsideTreatElapsed = 0.0f;
+                    ApplyParkOrders(handler);
+                }
+                continue;
+            }
+            if (!handler || !handler->isValid() || handler->isDead())
+                continue;
+
+            const float previous = entry.ringsideTreatElapsed;
+            entry.ringsideTreatElapsed += dt;
+            if (!entry.ringsideTreating)
+            {
+                entry.ringsideTreating = true;
+                entry.ringsideTreatElapsed = 0.0f;
+                handler->clearAllAIGoals();
+                handler->reThinkCurrentAIAction();
+                ClearParkOrders(handler);
+                ArenaMedical::IssueStabilizeOrder(handler, prisoner);
+                continue;
+            }
+            const int retry = static_cast<int>(entry.ringsideTreatElapsed / kTreatmentRetrySec);
+            const int previousRetry = static_cast<int>(previous / kTreatmentRetrySec);
+            if (retry != previousRetry)
+            {
+                ClearParkOrders(handler);
+                ArenaMedical::IssueStabilizeOrder(handler, prisoner);
+            }
+        }
+    }
+
     void ParkMatchHandlers()
     {
         for (size_t i = 0; i < g_matchHandlers.size(); ++i)
             ApplyParkOrders(g_matchHandlers[i]);
     }
 
+    void ReinforceParkedHandlers()
+    {
+        for (size_t i = 0; i < g_matchHandlers.size(); ++i)
+            ReinforceParkOrders(g_matchHandlers[i]);
+    }
+
+    void TickMatchUpkeep()
+    {
+        if (!g_matchHasPrisoner)
+        {
+            ResetMatchUpkeep();
+            return;
+        }
+
+        const float dt = AdvanceMatchUpkeepClock();
+        if (g_protectionImmediate ||
+            FrameCadencePolicy::Advance(
+                g_protectionElapsedSec, dt, kProtectionIntervalSec))
+        {
+            ProtectMatchPrisoners();
+            g_protectionImmediate = false;
+        }
+
+        if (SparSession::IsActive() &&
+            FrameCadencePolicy::Advance(
+                g_handlerElapsedSec, dt, kHandlerReinforceIntervalSec))
+        {
+            ReinforceParkedHandlers();
+        }
+    }
+
     void BeginReturnToCages(std::string& statusOut)
     {
-        statusOut.clear();
+        statusOut = g_cageReturnStatus;
+        // Cancellation/pre-save may revisit a return. Never replace its pending
+        // destination, handler, native order, or timeout with a fresh attempt.
+        if (g_returning || HasPendingCageLocks()) return;
         g_returning = false;
         g_returnLastTick = 0;
+        g_unlocking = false;
+        for (size_t i = 0; i < g_matchEntries.size(); ++i)
+            g_matchEntries[i].unlockPending = false;
 
         if (g_matchEntries.empty())
         {
@@ -1038,16 +1431,10 @@ namespace PrisonerUtil
         {
             for (size_t i = 0; i < g_matchEntries.size(); ++i)
             {
-                Character* prisoner = g_matchEntries[i].prisoner;
-                if (!prisoner || !prisoner->isValid() || prisoner->isDead())
-                    continue;
-
-                if (!statusOut.empty())
-                    statusOut += "\n";
-                statusOut += "Could not return ";
-                statusOut += prisoner->getName();
-                statusOut += " to cage";
+                Character* prisoner = g_matchEntries[i].prisonerHand.getCharacter();
+                ReportCageReturnFailure(prisoner, "no destination cage or pole is available");
             }
+            statusOut = g_cageReturnStatus;
             ClearMatchState();
             return;
         }
@@ -1075,18 +1462,33 @@ namespace PrisonerUtil
             entry.returnEscorting = false;
             entry.returnCarrying = false;
             entry.returnPickedUp = false;
+            entry.returnTreating = false;
             entry.returnElapsed = 0.0f;
             entry.returnCage = NULL;
             entry.returnCageBuilding = NULL;
 
+            entry.prisoner = entry.prisonerHand.getCharacter();
+            entry.handler = entry.handlerHand.getCharacter();
             Character* prisoner = entry.prisoner;
             if (!prisoner || !prisoner->isValid() || prisoner->isDead())
+            {
+                ReportCageReturnFailure(prisoner, "prisoner is missing or dead");
                 continue;
+            }
 
-            // Still locked in — nothing to return.
+            // An aborted unlock may leave an occupied yet unlocked cage.
+            // Verify it through the same placement/lock path as ordinary return.
             if (!entry.released)
+            {
+                entry.returnCageHand = entry.cageHand;
+                FinishCageEntry(entry);
+                if (entry.returnPending) anyPending = true;
                 continue;
+            }
 
+            // The fresh cage scan may have a different order after destruction.
+            entry.originalCageIndex = FindCageIndex(
+                AsUseableCage(entry.cageHand.getBuilding()), cages);
             const Ogre::Vector3 prisonerPos = prisoner->getPosition();
             for (int i = 0; i < count; ++i)
             {
@@ -1113,19 +1515,15 @@ namespace PrisonerUtil
 
             if (pick.index < 0)
             {
-                if (!statusOut.empty())
-                    statusOut += "\n";
-                statusOut += "Could not return ";
-                statusOut += prisoner->getName();
-                statusOut += " to cage";
+                ReportCageReturnFailure(prisoner, "no free destination cage or pole is available");
                 continue;
             }
 
             alreadyReserved[pick.index] = true;
             UseableStuff* cage = cages[static_cast<size_t>(pick.index)].useable;
-            Building* cageBuilding = cages[static_cast<size_t>(pick.index)].building;
             entry.returnCage = cage;
-            entry.returnCageBuilding = cageBuilding;
+            entry.returnCageBuilding = static_cast<Building*>(cage);
+            entry.returnCageHand = hand(static_cast<RootObjectBase*>(cage));
 
             const PrisonerMatchLogic::ReturnAction action =
                 PrisonerMatchLogic::ChooseReturnAction(
@@ -1136,42 +1534,24 @@ namespace PrisonerUtil
             if (handler && handler->isValid())
                 ClearParkOrders(handler);
 
-            if (action == PrisonerMatchLogic::ReturnEscortWalk)
+            entry.returnEscorting = action == PrisonerMatchLogic::ReturnEscortWalk;
+            entry.returnCarrying = action == PrisonerMatchLogic::ReturnCarry;
+            entry.returnPending = true;
+
+            const bool canTreat = handler && handler->isValid() && !handler->isDead();
+            if (ArenaMedical::ShouldStabilizePrisoner(ArenaMedical::GetProtocol()) &&
+                canTreat && ArenaMedical::NeedsStabilization(prisoner))
             {
-                entry.returnPending = true;
-                entry.returnEscorting = true;
-                entry.returnCarrying = false;
-                entry.returnPickedUp = false;
+                entry.returnTreating = true;
                 entry.returnElapsed = 0.0f;
                 anyPending = true;
-
-                if (cageBuilding)
-                {
-                    const Ogre::Vector3 cagePos = cageBuilding->getPosition();
-                    IssueMove(prisoner, cagePos);
-                    if (handler && handler->isValid() && !handler->isDead())
-                        IssueMove(handler, cagePos);
-                }
+                ArenaMedical::IssueStabilizeOrder(handler, prisoner);
             }
-            else if (action == PrisonerMatchLogic::ReturnCarry)
+            else
             {
-                entry.returnPending = true;
-                entry.returnEscorting = false;
-                entry.returnCarrying = true;
-                entry.returnPickedUp = false;
-                entry.returnElapsed = 0.0f;
-                anyPending = true;
-
-                if (handler && handler->isValid() && !handler->isDead())
-                    IssueLiftOrder(handler, prisoner);
-                else
-                    FinishCageEntry(entry);
-            }
-            else if (action == PrisonerMatchLogic::ReturnInstantCage)
-            {
-                FinishCageEntry(entry);
-                if (handler && handler->isValid() && !handler->isDead() && cageBuilding)
-                    IssueMove(handler, cageBuilding->getPosition());
+                BeginReturnMovement(entry);
+                if (entry.returnPending)
+                    anyPending = true;
             }
         }
 
@@ -1180,6 +1560,7 @@ namespace PrisonerUtil
         delete[] inRegistryRange;
         delete[] alreadyReserved;
 
+        if (g_cageReturnFailed) statusOut = g_cageReturnStatus;
         if (anyPending)
         {
             g_returning = true;
@@ -1195,6 +1576,7 @@ namespace PrisonerUtil
 
     void TickReturn()
     {
+        TickPendingCageLocks();
         if (!g_returning)
             return;
 
@@ -1214,9 +1596,10 @@ namespace PrisonerUtil
         for (size_t e = 0; e < g_matchEntries.size(); ++e)
         {
             MatchEntry& entry = g_matchEntries[e];
-            if (!entry.returnPending)
+            if (!entry.returnPending || entry.lockPending)
                 continue;
 
+            ResolveReturnReferences(entry);
             Character* prisoner = entry.prisoner;
             Character* handler = entry.handler;
             entry.returnElapsed += dt;
@@ -1224,10 +1607,37 @@ namespace PrisonerUtil
             if (!prisoner || !prisoner->isValid() || prisoner->isDead())
             {
                 entry.returnPending = false;
+                ReportCageReturnFailure(prisoner, "prisoner is missing or dead");
+                continue;
+            }
+            if (!entry.returnCage || entry.returnCage->isBroken())
+            {
+                FinishCageEntry(entry);
                 continue;
             }
 
             const bool timedOut = entry.returnElapsed >= kReturnTimeoutSec;
+
+            if (entry.returnTreating)
+            {
+                const bool treatmentTimedOut = entry.returnElapsed >= kTreatmentTimeoutSec;
+                const bool medicUnavailable = !handler || !handler->isValid() || handler->isDead();
+                if (!ArenaMedical::NeedsStabilization(prisoner) ||
+                    treatmentTimedOut || medicUnavailable)
+                {
+                    BeginReturnMovement(entry);
+                    if (entry.returnPending)
+                        anyPending = true;
+                    continue;
+                }
+
+                const int slot = static_cast<int>(entry.returnElapsed / kTreatmentRetrySec);
+                const int prevSlot = static_cast<int>((entry.returnElapsed - dt) / kTreatmentRetrySec);
+                if (slot != prevSlot)
+                    ArenaMedical::IssueStabilizeOrder(handler, prisoner);
+                anyPending = true;
+                continue;
+            }
 
             if (entry.returnCarrying)
             {
@@ -1293,17 +1703,20 @@ namespace PrisonerUtil
             if (arrived || timedOut)
             {
                 FinishCageEntry(entry);
-                if (handler && handler->isValid() && !handler->isDead() &&
-                    entry.returnCageBuilding)
-                {
-                    IssueMove(handler, entry.returnCageBuilding->getPosition());
-                }
                 continue;
             }
 
+            if (entry.returnCageBuilding)
+            {
+                const Ogre::Vector3 cagePos = entry.returnCageBuilding->getPosition();
+                IssueRun(prisoner, cagePos);
+                IssueRun(handler, HandlerTransitTarget(entry, cagePos, e));
+            }
             anyPending = true;
         }
 
+        for (size_t e = 0; e < g_matchEntries.size(); ++e)
+            if (g_matchEntries[e].returnPending) anyPending = true;
         if (!anyPending)
         {
             g_returning = false;
@@ -1316,35 +1729,66 @@ namespace PrisonerUtil
         return g_returning;
     }
 
-    void ReturnAllToCages(std::string& statusOut)
+    bool HasPendingCageLocks()
     {
-        // Force-complete path: instant cage everyone that still has a pickable cage.
-        BeginReturnToCages(statusOut);
+        for (size_t e = 0; e < g_matchEntries.size(); ++e)
+            if (g_matchEntries[e].lockPending) return true;
+        return false;
+    }
 
+    bool HasCageReturnFailure() { return g_cageReturnFailed; }
+    const std::string& GetCageReturnStatus() { return g_cageReturnStatus; }
+
+    void TickPendingCageLocks()
+    {
+        bool anyPending = false;
         for (size_t e = 0; e < g_matchEntries.size(); ++e)
         {
             MatchEntry& entry = g_matchEntries[e];
-            if (!entry.returnPending)
-                continue;
-            FinishCageEntry(entry);
-            Character* handler = entry.handler;
-            if (handler && handler->isValid() && !handler->isDead() &&
-                entry.returnCageBuilding)
-            {
-                IssueMove(handler, entry.returnCageBuilding->getPosition());
-            }
+            if (entry.lockPending) AdvanceCageLock(entry);
+            if (entry.returnPending) anyPending = true;
         }
+        if (g_returning && !anyPending)
+        {
+            g_returning = false;
+            ClearMatchState();
+        }
+    }
 
-        g_returning = false;
-        ClearMatchState();
+    void ReturnAllToCages(std::string& statusOut)
+    {
+        // Force placement, then retain native lock work until verified/failed.
+        BeginReturnToCages(statusOut);
+        bool anyPending = false;
+        for (size_t e = 0; e < g_matchEntries.size(); ++e)
+        {
+            MatchEntry& entry = g_matchEntries[e];
+            if (entry.returnPending && !entry.lockPending) FinishCageEntry(entry);
+            if (entry.returnPending) anyPending = true;
+        }
+        g_returning = anyPending;
+        if (!anyPending) ClearMatchState();
+        if (g_cageReturnFailed) statusOut = g_cageReturnStatus;
+        else if (anyPending) statusOut = "Waiting for native cage locks before return completes...";
+        else statusOut.clear();
     }
 
     void ClearMatchState()
     {
+        // UI cancellation must not cancel the handler's queued native lock or
+        // erase the handles required by the GUI/lifecycle tick.
+        if (HasPendingCageLocks()) return;
         if (g_handlerStatesRemembered && !g_matchHandlers.empty())
         {
-            FightStarter::DisengageMatch(
-                &g_matchHandlers[0], static_cast<int>(g_matchHandlers.size()));
+            std::vector<Character*> survivingHandlers;
+            for (size_t i = 0; i < g_matchEntries.size(); ++i)
+            {
+                Character* handler = g_matchEntries[i].handlerHand.getCharacter();
+                if (handler && handler->isValid()) survivingHandlers.push_back(handler);
+            }
+            if (!survivingHandlers.empty())
+                FightStarter::DisengageMatch(&survivingHandlers[0],
+                    static_cast<int>(survivingHandlers.size()));
         }
 
         g_matchEntries.clear();
@@ -1355,5 +1799,7 @@ namespace PrisonerUtil
         g_unlocking = false;
         g_returnLastTick = 0;
         g_unlockLastTick = 0;
+        g_ringsideAidLastTick = 0;
+        ResetMatchUpkeep();
     }
 }

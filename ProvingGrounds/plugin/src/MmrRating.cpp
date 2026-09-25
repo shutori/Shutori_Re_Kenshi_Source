@@ -1,4 +1,5 @@
 #include "MmrRating.h"
+#include "BalanceTuning.h"
 
 #include <cmath>
 
@@ -30,6 +31,21 @@ namespace MmrRating
             }
         }
 
+        // One definition of "opponent" for both the Elo expectation and the
+        // team-size balance, so the two can never disagree.
+        bool IsOpponentRow(
+            const SparPodium::Snapshot& snap,
+            const SparPodium::FighterRow& self,
+            const SparPodium::FighterRow& other)
+        {
+            if (snap.outcome == SparPodium::OutcomeLastStanding ||
+                snap.mode == MatchRules::ModeLastStanding)
+                return true;
+            return self.team != MatchRules::TeamNone &&
+                other.team != MatchRules::TeamNone &&
+                other.team != self.team;
+        }
+
         float OpponentAverage(
             const SparPodium::Snapshot& snap,
             int selfIndex,
@@ -44,21 +60,7 @@ namespace MmrRating
                 if (i == selfIndex)
                     continue;
 
-                const SparPodium::FighterRow& other = snap.fighters[i];
-                bool isOpponent = false;
-                if (snap.outcome == SparPodium::OutcomeLastStanding ||
-                    snap.mode == MatchRules::ModeLastStanding)
-                {
-                    isOpponent = true;
-                }
-                else if (self.team != MatchRules::TeamNone &&
-                    other.team != MatchRules::TeamNone &&
-                    other.team != self.team)
-                {
-                    isOpponent = true;
-                }
-
-                if (!isOpponent)
+                if (!IsOpponentRow(snap, self, snap.fighters[i]))
                     continue;
 
                 sum += mmrBefore[i];
@@ -68,6 +70,29 @@ namespace MmrRating
             if (n <= 0)
                 return kDefaultMmr;
             return sum / static_cast<float>(n);
+        }
+
+        // Rated team sizes around one fighter. Unrated fighters take no part in
+        // the rating economy, so they must not dilute the team balance either.
+        void TeamSizes(
+            const SparPodium::Snapshot& snap,
+            int selfIndex,
+            const bool* rateMask,
+            int& own,
+            int& opp)
+        {
+            own = 1;
+            opp = 0;
+            const SparPodium::FighterRow& self = snap.fighters[selfIndex];
+            for (int i = 0; i < snap.fighterCount; ++i)
+            {
+                if (i == selfIndex || (rateMask && !rateMask[i]))
+                    continue;
+                if (IsOpponentRow(snap, self, snap.fighters[i]))
+                    ++opp;
+                else
+                    ++own;
+            }
         }
     }
 
@@ -149,8 +174,13 @@ namespace MmrRating
         float perfMult[16];
         ComputePerfMultipliers(snap.fighters, snap.fighterCount, perfMult);
 
+        const bool zeroSum = BalanceTuning::Get().zeroSumRating;
+
+        // Pass 1 - raw delta per rated fighter, weighted by rated team sizes.
+        float pending[16];
         for (int i = 0; i < snap.fighterCount; ++i)
         {
+            pending[i] = 0.0f;
             if (!rateMask[i])
                 continue;
 
@@ -166,6 +196,54 @@ namespace MmrRating
                 : 2.0f - perfMult[i];
             float delta = k * (S - E) * resultMult;
             delta = Clamp(delta, -kMaxAbsDelta, kMaxAbsDelta);
+
+            if (zeroSum)
+            {
+                // Each member's share of the result is diluted by their own team
+                // size and amplified by the opposing one. For equal teams this is
+                // exactly 1.0, so 1v1 behaviour is untouched.
+                int own = 1, opp = 0;
+                TeamSizes(snap, i, rateMask, own, opp);
+                if (opp > 0)
+                    delta *= (2.0f * opp) / static_cast<float>(own + opp);
+            }
+            pending[i] = delta;
+        }
+
+        // Pass 2 - remove the residual. The weights alone are only exactly
+        // zero-sum when E and the performance multiplier are uniform, so rescale
+        // the losing side to make the bout conserve rating in every case. Once
+        // pass 1 has run this factor is near 1.0, so it cannot blow past the
+        // clamp.
+        if (zeroSum)
+        {
+            float gain = 0.0f, loss = 0.0f;
+            for (int i = 0; i < snap.fighterCount; ++i)
+            {
+                if (!rateMask[i])
+                    continue;
+                if (pending[i] > 0.0f)
+                    gain += pending[i];
+                else if (pending[i] < 0.0f)
+                    loss -= pending[i];
+            }
+            if (gain > 0.0001f && loss > 0.0001f && fabsf(gain - loss) > 0.0001f)
+            {
+                const float scale = gain / loss;
+                for (int i = 0; i < snap.fighterCount; ++i)
+                    if (rateMask[i] && pending[i] < 0.0f)
+                        pending[i] *= scale;
+            }
+        }
+
+        // Pass 3 - apply, clamp, write.
+        for (int i = 0; i < snap.fighterCount; ++i)
+        {
+            if (!rateMask[i])
+                continue;
+
+            const float S = FighterWon(snap, snap.fighters[i]) ? 1.0f : 0.0f;
+            const float delta = Clamp(pending[i], -kMaxAbsDelta, kMaxAbsDelta);
 
             float next = mmrBefore[i] + delta;
             if (next < kFloorMmr)

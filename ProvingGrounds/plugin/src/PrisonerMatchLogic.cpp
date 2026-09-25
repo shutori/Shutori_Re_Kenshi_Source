@@ -5,6 +5,20 @@
 
 namespace PrisonerMatchLogic
 {
+    CageLockAction ChooseCageLockAction(const CageLockObservation& observation)
+    {
+        if (!observation.destinationValid) return CageLockMissingDestination;
+        if (observation.broken) return CageLockBroken;
+        if (!observation.correctOccupant) return CageLockWrongOccupant;
+        if (!observation.hasLock) return CageLockMissingLock;
+        if (!observation.verifierAvailable) return CageLockNoVerifier;
+        if (observation.locked) return CageLockSecured;
+        if (!observation.handlerAvailable) return CageLockNoHandler;
+        if (observation.orderRejected) return CageLockOrderFailed;
+        if (observation.timedOut) return CageLockTimedOut;
+        return observation.orderIssued ? CageLockWait : CageLockIssueOrder;
+    }
+
     bool HasEnoughHandlers(int prisonersInMatch, int availableHandlers)
     {
         return availableHandlers >= prisonersInMatch;

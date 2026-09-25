@@ -16,6 +16,30 @@ namespace PrisonerMatchLogic
         ReturnCarry = 3
     };
 
+    enum CageLockAction
+    {
+        CageLockSecured, CageLockIssueOrder, CageLockWait,
+        CageLockMissingDestination, CageLockWrongOccupant, CageLockMissingLock,
+        CageLockBroken, CageLockNoVerifier, CageLockNoHandler,
+        CageLockOrderFailed, CageLockTimedOut
+    };
+
+    struct CageLockObservation
+    {
+        bool destinationValid;
+        bool correctOccupant;
+        bool hasLock;
+        bool broken;
+        bool verifierAvailable;
+        bool locked;
+        bool handlerAvailable;
+        bool orderIssued;
+        bool orderRejected;
+        bool timedOut;
+    };
+
+    CageLockAction ChooseCageLockAction(const CageLockObservation& observation);
+
     bool HasEnoughHandlers(int prisonersInMatch, int availableHandlers);
 
     std::string FormatHandlerShortage(int prisonersInMatch, int availableHandlers);

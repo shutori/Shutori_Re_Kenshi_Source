@@ -30,6 +30,10 @@ namespace SparPodium
         float ratingAfter;
         float ratingDelta;
         bool ratingUpdated;
+        int marksBefore;
+        int marksAfter;
+        int marksEarned;
+        bool marksUpdated;
     };
 
     struct PodiumEntry

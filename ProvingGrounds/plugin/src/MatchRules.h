@@ -9,6 +9,19 @@ namespace MatchRules
         EndNone, EndTeamWipeA, EndTeamWipeB, EndLastStanding, EndDraw
     };
 
+    // Discriminating label for the log. CombatBalanceLog used to record only
+    // SparSession::StopReason, which routes EVERY terminal outcome through the
+    // KO branch, so a team wipe and a mutual knockout were indistinguishable.
+    inline const char* EndKindName(MatchEndKind kind) {
+        switch (kind) {
+        case EndTeamWipeA: return "team_wipe_a";
+        case EndTeamWipeB: return "team_wipe_b";
+        case EndLastStanding: return "last_standing";
+        case EndDraw: return "draw";
+        default: return "none";
+        }
+    }
+
     struct MatchParticipant
     {
         int id;
@@ -20,5 +33,9 @@ namespace MatchRules
     };
 
     bool IsOpponent(MatchMode mode, const MatchParticipant& a, const MatchParticipant& b);
-    MatchEndKind EvaluateEnd(MatchMode mode, const MatchParticipant* list, int count);
+    // downedPercent 0 requires an entire team to be down (shipped behaviour).
+    // A positive value ends a team bout as soon as that percentage of the team is
+    // down, which bounds the injury load a single bout can inflict.
+    MatchEndKind EvaluateEnd(MatchMode mode, const MatchParticipant* list, int count,
+        int downedPercent = 0);
 }

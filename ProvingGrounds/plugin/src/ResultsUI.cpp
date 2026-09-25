@@ -1,10 +1,12 @@
 #include "ResultsUI.h"
 #include "SparStats.h"
-
-#include <Debug.h>
-
+#include "NativeUI.h"
+#include "ResultsLayout.h"
+#include "PGLog.h"
 #include <Windows.h>
 #include <cstdio>
+#include <exception>
+#include <stdexcept>
 #include <string>
 
 #pragma warning(push)
@@ -13,489 +15,446 @@
 #include <kenshi/gui/PortraitManager.h>
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Button.h>
-#include <mygui/MyGUI_Colour.h>
 #include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_ImageBox.h>
+#include <mygui/MyGUI_RenderManager.h>
+#include <mygui/MyGUI_ScrollView.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
-#include <ogre/OgreResourceGroupManager.h>
 #pragma warning(pop)
-
-#ifndef NULL
-#define NULL 0
-#endif
 
 namespace
 {
-    const MyGUI::Colour kBgDark(26.f / 255.f, 22.f / 255.f, 18.f / 255.f, 1.f);
-    const MyGUI::Colour kTextPrimary(232.f / 255.f, 220.f / 255.f, 200.f / 255.f, 1.f);
-    const MyGUI::Colour kBrass(196.f / 255.f, 165.f / 255.f, 116.f / 255.f, 1.f);
-    const MyGUI::Colour kMuted(154.f / 255.f, 139.f / 255.f, 114.f / 255.f, 1.f);
-    const MyGUI::Colour kAmber(222.f / 255.f, 169.f / 255.f, 76.f / 255.f, 1.f);
-    const MyGUI::Colour kSilver(181.f / 255.f, 177.f / 255.f, 166.f / 255.f, 1.f);
-    const MyGUI::Colour kBronze(169.f / 255.f, 116.f / 255.f, 70.f / 255.f, 1.f);
-    const MyGUI::Colour kChromeHover(238.f / 255.f, 185.f / 255.f, 86.f / 255.f, 1.f);
-
     bool g_pending = false;
-    float g_delaySec = 0.8f;
+    float g_delaySec = 1.0f;
     float g_elapsedSec = 0.0f;
     DWORD g_lastTick = 0;
-
     MyGUI::Window* g_window = NULL;
-    MyGUI::ImageBox* g_resultsBg = NULL;
-    MyGUI::ImageBox* g_resultsTop = NULL;
-    MyGUI::TextBox* g_header = NULL;
-    MyGUI::TextBox* g_context = NULL;
-    MyGUI::TextBox* g_empty = NULL;
-    MyGUI::TextBox* g_closeBtn = NULL;
-    bool g_resultsResourcesReady = false;
-
-    static const char* kResultsTexture = "results_ui.png";
-    static const char* kResultsTopTexture = "arena_top.png";
-    static const char* kGuiResourceGroup = "GUI";
+    MyGUI::TextBox* g_measure = NULL;
+    MyGUI::EditBox* g_header = NULL;
+    MyGUI::EditBox* g_context = NULL;
+    MyGUI::EditBox* g_empty = NULL;
+    MyGUI::Button* g_closeBtn = NULL;
+    MyGUI::ScrollView* g_scroll = NULL;
+    MyGUI::Widget* g_headerRails[2] = {};
+    MyGUI::IntSize g_clientSize;
+    MyGUI::IntSize g_screenSize;
+    int g_fontHeight = 0;
+    int g_contentHeight = 0;
 
     struct PodiumSlot
     {
-        MyGUI::Button* surface;
+        MyGUI::Widget* root;
         MyGUI::ImageBox* portrait;
+        MyGUI::TextBox* placeholder;
         MyGUI::TextBox* rankLabel;
-        MyGUI::TextBox* nameLabel;
-        MyGUI::TextBox* statsLabel;
+        MyGUI::EditBox* nameLabel;
+        MyGUI::EditBox* statsLabel;
+        MyGUI::Widget* portraitBorder[4];
+        MyGUI::Widget* cardBorder[4];
+        bool portraitAvailable;
+        int place;
     };
+    PodiumSlot g_slots[3] = {};
 
-    // Visual order: 0 = victor, 1 = second, 2 = third.
-    PodiumSlot g_slots[3];
-
-    void TintWidget(MyGUI::Widget* widget, const MyGUI::Colour& colour)
+    int Max(int a, int b) { return a > b ? a : b; }
+    int Min(int a, int b) { return a < b ? a : b; }
+    int BodyHeight() { return Max(1, Max(g_measure->getFontHeight(), g_measure->getTextSize().height)); }
+    void LayoutWindow();
+    void OnCloseClicked(MyGUI::Widget*) { ResultsUI::Close(); }
+    void OnWindowButtonPressed(MyGUI::Widget*, const std::string& name)
     {
-        if (widget)
-            widget->setColour(colour);
+        if (name == "close" || name == "Close") ResultsUI::Close();
     }
-
-    std::string GetPluginModDirectory()
+    void OnWheel(MyGUI::Widget*, int relative)
     {
-        HMODULE module = NULL;
-        if (!GetModuleHandleExA(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                (LPCSTR)&GetPluginModDirectory,
-                &module) ||
-            !module)
+        if (!g_scroll || !relative) return;
+        const int maximum = Max(0, g_contentHeight - g_scroll->getViewCoord().height);
+        const int next = -g_scroll->getViewOffset().top + (relative < 0 ? 3 : -3) * BodyHeight();
+        g_scroll->setViewOffset(MyGUI::IntPoint(0, -Min(maximum, Max(0, next))));
+    }
+    void BindWheel(MyGUI::Widget* widget)
+    {
+        while (widget)
         {
-            return std::string();
+            widget->setNeedMouseFocus(true);
+            widget->eventMouseWheel += MyGUI::newDelegate(OnWheel);
+            MyGUI::Widget* client = widget->getClientWidget();
+            if (client == widget) break;
+            widget = client;
         }
-
-        char path[MAX_PATH];
-        const DWORD length = GetModuleFileNameA(module, path, MAX_PATH);
-        if (length == 0 || length >= MAX_PATH)
-            return std::string();
-
-        std::string fullPath(path, path + length);
-        const size_t slash = fullPath.find_last_of("\\/");
-        if (slash == std::string::npos)
-            return std::string();
-        return fullPath.substr(0, slash);
     }
-
-    bool EnsureResultsResources()
+    int WrappedHeight(MyGUI::TextBox* label, int x, int y, int width)
     {
-        if (g_resultsResourcesReady)
-            return true;
-
-        const std::string modDirectory = GetPluginModDirectory();
-        if (modDirectory.empty())
+        label->setCoord(x, y, Max(1, width), BodyHeight());
+        const int insets = Max(0, label->getHeight() - label->getTextRegion().height);
+        const int height = Max(BodyHeight(), label->getTextSize().height + insets);
+        label->setSize(Max(1, width), height);
+        return height;
+    }
+    bool BindPortrait(MyGUI::ImageBox* image, Character* character)
+    {
+        PortraitManager* manager = PortraitManager::getInstance();
+        if (!character || !character->isValid() || !manager)
         {
-            ErrorLog("Proving Grounds: could not resolve Results UI image directory");
+            image->setVisible(false);
             return false;
         }
-
-        const std::string imagesDirectory = modDirectory + "\\gui\\images";
+        manager->setImageWidget(character->getHandle(), image, true);
+        image->setVisible(true);
+        return true;
+    }
+    MyGUI::Colour RankColour(int place)
+    {
+        if (place == 1) return MyGUI::Colour(.82f, .63f, .26f);
+        if (place == 2) return MyGUI::Colour(.66f, .69f, .72f);
+        if (place == 3) return MyGUI::Colour(.62f, .37f, .20f);
+        return g_measure->getTextColour();
+    }
+    MyGUI::Widget* OptionalAccent(
+        MyGUI::Widget* parent,
+        const MyGUI::IntCoord& coord,
+        const std::string& name,
+        float alpha)
+    {
         try
         {
-            Ogre::ResourceGroupManager& resources =
-                Ogre::ResourceGroupManager::getSingleton();
-            const bool hasBackground =
-                resources.resourceExists(kGuiResourceGroup, kResultsTexture);
-            const bool hasTop =
-                resources.resourceExists(kGuiResourceGroup, kResultsTopTexture);
-            if (!hasBackground || !hasTop)
-            {
-                resources.addResourceLocation(
-                    imagesDirectory,
-                    "FileSystem",
-                    kGuiResourceGroup,
-                    false);
-                DebugLog(
-                    ("Proving Grounds: registered Results UI images at " +
-                        imagesDirectory).c_str());
-            }
-            g_resultsResourcesReady = true;
-            return true;
+            MyGUI::Widget* accent = parent->createWidget<MyGUI::Widget>(
+                "WhiteSkin", coord, MyGUI::Align::Default, name);
+            accent->setAlpha(alpha);
+            BindWheel(accent);
+            return accent;
         }
         catch (...)
         {
-            ErrorLog("Proving Grounds: failed to register Results UI image resources");
-            return false;
+            PGLog::Error("Proving Grounds: results accent skin unavailable");
+            return NULL;
         }
     }
-
-    void ApplyResultsTexture()
+    void SetAccent(
+        MyGUI::Widget* accent,
+        const MyGUI::IntCoord& coord,
+        const MyGUI::Colour& colour,
+        bool visible)
     {
-        if (!EnsureResultsResources())
-            return;
-        if (g_resultsBg)
-        {
-            g_resultsBg->setImageTexture(kResultsTexture);
-            g_resultsBg->setNeedMouseFocus(false);
-            g_resultsBg->setVisible(true);
-        }
-        if (g_resultsTop)
-        {
-            g_resultsTop->setImageTexture(kResultsTopTexture);
-            g_resultsTop->setNeedMouseFocus(false);
-            g_resultsTop->setVisible(true);
-        }
+        if (!accent) return;
+        accent->setCoord(coord);
+        accent->setColour(colour);
+        accent->setVisible(visible);
     }
-
-    void InstallResultsTopBar(MyGUI::Window* window)
-    {
-        if (!window || g_resultsTop)
-            return;
-
-        MyGUI::TextBox* caption = window->getCaptionWidget();
-        MyGUI::Widget* header = caption ? caption->getParent() : NULL;
-        if (!header)
-            header = window;
-
-        MyGUI::Widget* closeButton = NULL;
-        MyGUI::Widget* searchRoot = caption ? caption->getParent() : window;
-        if (searchRoot)
-        {
-            for (size_t i = 0; i < searchRoot->getChildCount(); ++i)
-            {
-                MyGUI::Widget* child = searchRoot->getChildAt(i);
-                if (child && child->getUserString("Event") == "close")
-                {
-                    closeButton = child;
-                    break;
-                }
-            }
-        }
-
-        const int barHeight = header == static_cast<MyGUI::Widget*>(window)
-            ? 38
-            : header->getHeight();
-        const int barWidth =
-            header->getWidth() > 0 ? header->getWidth() : window->getWidth();
-
-        g_resultsTop = header->createWidget<MyGUI::ImageBox>(
-            "ImageBox",
-            0,
-            0,
-            barWidth,
-            barHeight > 0 ? barHeight : 38,
-            MyGUI::Align::HStretch | MyGUI::Align::Top,
-            "PG_ResultsTop");
-        ApplyResultsTexture();
-
-        if (caption && caption->getParent() == header)
-        {
-            const MyGUI::IntCoord coord = caption->getCoord();
-            const MyGUI::Align align = caption->getAlign();
-            caption->detachFromWidget();
-            caption->attachToWidget(header);
-            caption->setCoord(coord);
-            caption->setAlign(align);
-            TintWidget(caption, kBrass);
-        }
-        if (closeButton && closeButton->getParent() == header)
-        {
-            const MyGUI::IntCoord coord = closeButton->getCoord();
-            const MyGUI::Align align = closeButton->getAlign();
-            closeButton->detachFromWidget();
-            closeButton->attachToWidget(header);
-            closeButton->setCoord(coord);
-            closeButton->setAlign(align);
-        }
-    }
-
-    void OnCloseClicked(MyGUI::Widget* /*sender*/)
-    {
-        ResultsUI::Close();
-    }
-
-    void OnWindowButtonPressed(MyGUI::Widget* /*sender*/, const std::string& name)
-    {
-        if (name == "close" || name == "Close")
-            ResultsUI::Close();
-    }
-
-    MyGUI::TextBox* MakeLabel(
-        MyGUI::Widget* parent,
-        float x,
-        float y,
-        float width,
-        float height,
-        const char* name,
-        const char* caption)
-    {
-        MyGUI::TextBox* label = parent->createWidgetReal<MyGUI::TextBox>(
-            "Kenshi_TextboxStandardText",
-            x,
-            y,
-            width,
-            height,
-            MyGUI::Align::Default,
-            name);
-        label->setCaption(caption);
-        label->setFontHeight(16);
-        label->setTextColour(kTextPrimary);
-        label->setTextShadow(true);
-        label->setTextShadowColour(MyGUI::Colour::Black);
-        TintWidget(label, kTextPrimary);
-        return label;
-    }
-
-    MyGUI::TextBox* MakeButton(
-        MyGUI::Widget* parent,
-        float x,
-        float y,
-        float width,
-        float height,
-        const char* name,
-        const char* caption)
-    {
-        MyGUI::TextBox* button = parent->createWidgetReal<MyGUI::TextBox>(
-            "Kenshi_TextboxStandardText",
-            x,
-            y,
-            width,
-            height,
-            MyGUI::Align::Default,
-            name);
-        button->setCaption(caption);
-        button->setFontHeight(20);
-        button->setTextAlign(MyGUI::Align::Center);
-        button->setTextColour(kTextPrimary);
-        button->setTextShadow(true);
-        button->setTextShadowColour(MyGUI::Colour::Black);
-        button->setNeedMouseFocus(true);
-        TintWidget(button, kTextPrimary);
-        return button;
-    }
-
-    void OnCloseHover(MyGUI::Widget* sender, MyGUI::Widget* /*oldFocus*/)
-    {
-        MyGUI::TextBox* label = static_cast<MyGUI::TextBox*>(sender);
-        label->setTextColour(kChromeHover);
-        TintWidget(label, kChromeHover);
-    }
-
-    void OnCloseLeave(MyGUI::Widget* sender, MyGUI::Widget* /*newFocus*/)
-    {
-        MyGUI::TextBox* label = static_cast<MyGUI::TextBox*>(sender);
-        label->setTextColour(kTextPrimary);
-        TintWidget(label, kTextPrimary);
-    }
-
-    void BindPortrait(MyGUI::ImageBox* image, Character* character)
-    {
-        if (!image)
-            return;
-        if (!character || !character->isValid())
-        {
-            image->setVisible(false);
-            return;
-        }
-
-        PortraitManager* portraitManager = PortraitManager::getInstance();
-        if (portraitManager)
-            portraitManager->setImageWidget(character->getHandle(), image, true);
-        image->setVisible(true);
-    }
-
-    void MakeSlot(
-        MyGUI::Widget* client,
+    void LayoutPortrait(
         PodiumSlot& slot,
-        float x,
-        float y,
-        float width,
-        float height,
-        bool victor,
-        const char* baseName)
+        int x,
+        int y,
+        int size,
+        const MyGUI::Colour& colour,
+        int edge)
     {
-        char name[64];
-        const float contentX = victor ? 0.30f : 0.36f;
-
-        // Card recesses and borders are baked into the results texture.
-        slot.surface = NULL;
-
-        sprintf_s(name, "%s_Portrait", baseName);
-        slot.portrait = client->createWidgetReal<MyGUI::ImageBox>(
-            "ImageBox",
-            x + width * (victor ? 0.055f : 0.06f),
-            y + height * (victor ? 0.16f : 0.20f),
-            width * (victor ? 0.20f : 0.25f),
-            height * (victor ? 0.68f : 0.60f),
-            MyGUI::Align::Default,
-            name);
-        slot.portrait->setVisible(false);
-
-        sprintf_s(name, "%s_Rank", baseName);
-        slot.rankLabel = MakeLabel(
-            client,
-            x + width * contentX,
-            y + height * 0.12f,
-            width * (0.94f - contentX),
-            height * 0.18f,
-            name,
-            "");
-        slot.rankLabel->setFontHeight(victor ? 18 : 17);
-
-        sprintf_s(name, "%s_Name", baseName);
-        slot.nameLabel = MakeLabel(
-            client,
-            x + width * contentX,
-            y + height * 0.31f,
-            width * (0.94f - contentX),
-            height * 0.24f,
-            name,
-            "");
-        slot.nameLabel->setFontHeight(victor ? 22 : 18);
-
-        sprintf_s(name, "%s_Stats", baseName);
-        slot.statsLabel = MakeLabel(
-            client,
-            x + width * contentX,
-            y + height * 0.57f,
-            width * (0.94f - contentX),
-            height * 0.36f,
-            name,
-            "");
-        slot.statsLabel->setFontHeight(victor ? 17 : 16);
-        TintWidget(slot.statsLabel, kMuted);
+        slot.portrait->setCoord(x, y, size, size);
+        slot.portrait->setVisible(slot.portraitAvailable);
+        slot.placeholder->setCoord(x, y, size, size);
+        slot.placeholder->setVisible(!slot.portraitAvailable);
+        const MyGUI::IntCoord borders[4] = {
+            MyGUI::IntCoord(x, y, edge, size),
+            MyGUI::IntCoord(x, y, size, edge),
+            MyGUI::IntCoord(x, y + size - edge, size, edge),
+            MyGUI::IntCoord(x + size - edge, y, edge, size)
+        };
+        for (int i = 0; i < 4; ++i)
+            SetAccent(slot.portraitBorder[i], borders[i], colour, true);
     }
-
+    int LayoutResultCard(
+        PodiumSlot& slot,
+        int left,
+        int top,
+        int width,
+        int portrait,
+        int gap,
+        int body,
+        int edge)
+    {
+        slot.root->setVisible(true);
+        slot.rankLabel->setTextAlign(MyGUI::Align::Center | MyGUI::Align::VCenter);
+        slot.nameLabel->setTextAlign(MyGUI::Align::Center | MyGUI::Align::Top);
+        slot.statsLabel->setTextAlign(MyGUI::Align::Center | MyGUI::Align::Top);
+        slot.rankLabel->setCoord(gap, gap, Max(1, width - 2 * gap), body);
+        const int portraitTop = body + 2 * gap;
+        LayoutPortrait(slot, Max(0, (width - portrait) / 2), portraitTop,
+            portrait, RankColour(slot.place), edge);
+        const int nameTop = portraitTop + portrait + gap;
+        const int innerWidth = Max(1, width - 2 * gap);
+        const int nameHeight = WrappedHeight(
+            slot.nameLabel, gap, nameTop, innerWidth);
+        const int statsTop = nameTop + nameHeight + gap;
+        const int statsHeight = WrappedHeight(
+            slot.statsLabel, gap, statsTop, innerWidth);
+        const int height = statsTop + statsHeight + 2 * gap;
+        slot.root->setCoord(left, top, width, height);
+        const MyGUI::Colour colour = RankColour(slot.place);
+        SetAccent(slot.cardBorder[0], MyGUI::IntCoord(0, 0, edge, height), colour, true);
+        SetAccent(slot.cardBorder[1], MyGUI::IntCoord(0, 0, width, edge), colour, true);
+        SetAccent(slot.cardBorder[2], MyGUI::IntCoord(0, height - edge, width, edge), colour, true);
+        SetAccent(slot.cardBorder[3], MyGUI::IntCoord(width - edge, 0, edge, height), colour, true);
+        return height;
+    }
     void SetSlotVisible(PodiumSlot& slot, bool visible)
     {
-        if (slot.surface)
-            slot.surface->setVisible(visible);
-        if (slot.portrait)
-            slot.portrait->setVisible(visible);
-        if (slot.rankLabel)
-            slot.rankLabel->setVisible(visible);
-        if (slot.nameLabel)
-            slot.nameLabel->setVisible(visible);
-        if (slot.statsLabel)
-            slot.statsLabel->setVisible(visible);
+        slot.root->setVisible(visible);
     }
-
-    void EnsureWindow()
+    void AbandonWindow()
     {
-        if (g_window)
-            return;
+        if (g_window) MyGUI::Gui::getInstance().destroyWidget(g_window);
+        g_window = NULL;
+        g_measure = NULL;
+        g_header = g_context = g_empty = NULL;
+        g_closeBtn = NULL;
+        g_scroll = NULL;
+        g_headerRails[0] = g_headerRails[1] = NULL;
+        for (int i = 0; i < 3; ++i) g_slots[i] = PodiumSlot();
+        g_clientSize = g_screenSize = MyGUI::IntSize();
+    }
+    int VisibleResultCount()
+    {
+        int count = 0;
+        for (int i = 0; i < 3; ++i)
+            if (g_slots[i].root->getVisible()) ++count;
+        return count;
+    }
+    void FitWindowToContent(bool force = false)
+    {
+        MyGUI::RenderManager* render = MyGUI::RenderManager::getInstancePtr();
+        if (!render) return;
+        const MyGUI::IntSize screen = render->getViewSize();
+        if (screen.width <= 0 || screen.height <= 0) return;
+        if (!force && screen == g_screenSize && BodyHeight() == g_fontHeight) return;
+        g_screenSize = screen;
 
-        MyGUI::Gui* guiInstance = MyGUI::Gui::getInstancePtr();
-        if (!guiInstance)
-            return;
+        const int gap = NativeUI::Spacing(g_measure);
+        const int body = BodyHeight();
+        const int count = VisibleResultCount();
+        const LeaderboardLayout::CeremonialMetrics metrics =
+            LeaderboardLayout::FitCeremonialMetrics(body, gap);
+        const int naturalCell = metrics.championPortrait + 20 * gap;
+        int contentWidth = count > 0
+            ? count * naturalCell + (count - 1) * gap
+            : g_empty->getTextSize().width + 4 * gap;
+        contentWidth = Max(contentWidth, g_header->getTextSize().width + 8 * gap);
+        contentWidth = Max(contentWidth, g_context->getTextSize().width + 4 * gap);
+        contentWidth = Max(contentWidth, g_closeBtn->getTextSize().width + 4 * gap);
 
-        g_window = guiInstance->createWidgetReal<MyGUI::Window>(
-            "Kenshi_WindowCX",
-            0.22f,
-            0.13f,
-            0.56f,
-            0.68f,
-            MyGUI::Align::Center,
-            "Window",
-            "ProvingGroundsResultsWindow");
-        g_window->setCaption("Proving Grounds - Results");
-        g_window->setVisible(false);
-        g_window->eventWindowButtonPressed += MyGUI::newDelegate(OnWindowButtonPressed);
-        TintWidget(g_window, kBgDark);
-        InstallResultsTopBar(g_window);
+        const MyGUI::IntSize outerBefore = g_window->getSize();
+        const MyGUI::IntSize clientBefore = g_window->getClientWidget()->getSize();
+        const int chromeWidth = Max(0, outerBefore.width - clientBefore.width);
+        const int chromeHeight = Max(0, outerBefore.height - clientBefore.height);
+        const int scrollInsetWidth = Max(0,
+            g_scroll->getWidth() - g_scroll->getViewCoord().width);
+        const int maximumWidth = screen.width * 92 / 100;
+        const int maximumHeight = screen.height * 90 / 100;
+        const int desiredClientWidth = contentWidth + 4 * gap + scrollInsetWidth;
+        const int outerWidth = Min(maximumWidth,
+            Max(320, desiredClientWidth + chromeWidth));
 
-        MyGUI::Widget* client = g_window->getClientWidget();
-        if (!client)
-            return;
-
-        g_resultsBg = client->createWidgetReal<MyGUI::ImageBox>(
-            "ImageBox",
-            0.0f,
-            0.0f,
-            1.0f,
-            1.0f,
-            MyGUI::Align::Default,
-            "PG_ResultsBackground");
-        ApplyResultsTexture();
-
-        MyGUI::TextBox* title = MakeLabel(
-            client,
-            0.08f,
-            0.012f,
-            0.84f,
-            0.045f,
-            "PG_ResultsTitle",
-            "MATCH COMPLETE");
-        title->setFontHeight(16);
-        title->setTextAlign(MyGUI::Align::Center);
-        TintWidget(title, kBrass);
-
-        g_header = MakeLabel(
-            client,
-            0.08f,
-            0.052f,
-            0.84f,
-            0.068f,
-            "PG_ResultsHeader",
-            "");
-        g_header->setFontHeight(26);
-        g_header->setTextAlign(MyGUI::Align::Center);
-        TintWidget(g_header, kAmber);
-
-        g_context = MakeLabel(
-            client,
-            0.08f,
-            0.116f,
-            0.84f,
-            0.04f,
-            "PG_ResultsContext",
-            "");
-        g_context->setFontHeight(18);
-        g_context->setTextAlign(MyGUI::Align::Center);
-        TintWidget(g_context, kMuted);
-
-        MakeSlot(
-            client, g_slots[0], 0.12f, 0.175f, 0.76f, 0.27f, true, "PG_Results1st");
-        MakeSlot(
-            client, g_slots[1], 0.12f, 0.455f, 0.365f, 0.23f, false, "PG_Results2nd");
-        MakeSlot(
-            client, g_slots[2], 0.515f, 0.455f, 0.365f, 0.23f, false, "PG_Results3rd");
-
-        g_empty = MakeLabel(
-            client,
-            0.18f,
-            0.30f,
-            0.64f,
-            0.25f,
-            "PG_ResultsEmpty",
-            "No victor\nThe match ended without a podium.");
-        g_empty->setFontHeight(18);
-        g_empty->setTextAlign(MyGUI::Align::Center);
-        TintWidget(g_empty, kMuted);
-        g_empty->setVisible(false);
-
-        g_closeBtn = MakeButton(
-            client,
-            0.345f,
-            0.845f,
-            0.31f,
-            0.060f,
-            "PG_ResultsClose",
-            "CLOSE RESULTS");
-        g_closeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnCloseClicked);
-        g_closeBtn->eventMouseSetFocus += MyGUI::newDelegate(OnCloseHover);
-        g_closeBtn->eventMouseLostFocus += MyGUI::newDelegate(OnCloseLeave);
+        // Use the screen-height cap for the measuring pass, then collapse the
+        // window around the actual canvas and persistent close button.
+        g_window->setCoord((screen.width - outerWidth) / 2,
+            (screen.height - maximumHeight) / 2, outerWidth, maximumHeight);
+        LayoutWindow();
+        const int scrollInsetHeight = Max(0,
+            g_scroll->getHeight() - g_scroll->getViewCoord().height);
+        const int closeHeight = NativeUI::RowHeight(g_closeBtn, 0);
+        const int desiredClientHeight = g_contentHeight + scrollInsetHeight +
+            closeHeight + 3 * gap;
+        const int outerHeight = Min(maximumHeight,
+            Max(180, desiredClientHeight + chromeHeight));
+        g_window->setCoord((screen.width - outerWidth) / 2,
+            (screen.height - outerHeight) / 2, outerWidth, outerHeight);
+    }
+    void LayoutWindow()
+    {
+        const MyGUI::IntSize size = g_window->getClientWidget()->getSize();
+        const int gap = NativeUI::Spacing(g_measure);
+        const int body = BodyHeight();
+        const int width = Max(1, size.width - 2 * gap);
+        const int closeHeight = NativeUI::RowHeight(g_closeBtn, 0);
+        const int closeTop = Max(gap, size.height - gap - closeHeight);
+        const int closeWidth = Min(width, g_closeBtn->getTextSize().width + 4 * gap);
+        g_closeBtn->setCoord((size.width - closeWidth) / 2, closeTop, closeWidth, closeHeight);
+        // The outcome, context and three existing entries share a single canvas;
+        // long snapshots scroll without displacing the persistent close action.
+        g_scroll->setCoord(gap, gap, width, Max(1, closeTop - 2 * gap));
+        const int oldOffset = -g_scroll->getViewOffset().top;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const MyGUI::IntCoord view = g_scroll->getViewCoord();
+            const int contentWidth = Max(1, view.width - 2 * gap);
+            int resultCount = 0;
+            for (int i = 0; i < 3; ++i)
+                if (g_slots[i].root->getVisible()) ++resultCount;
+            const ResultsLayout::Ceremony ceremony =
+                ResultsLayout::FitCeremony(
+                    contentWidth, gap, body, resultCount,
+                    g_measure->getTextSize().width + 4 * gap);
+            int y = gap;
+            const int headerHeight = WrappedHeight(
+                g_header, gap + ceremony.title.titleLeft, y,
+                ceremony.title.titleWidth);
+            const int railTop = y + (headerHeight - ceremony.metrics.edge) / 2;
+            SetAccent(g_headerRails[0],
+                MyGUI::IntCoord(gap, railTop,
+                    ceremony.title.leftWidth, ceremony.metrics.edge),
+                RankColour(1), ceremony.title.leftWidth > 0);
+            SetAccent(g_headerRails[1],
+                MyGUI::IntCoord(gap + ceremony.title.rightLeft, railTop,
+                    ceremony.title.rightWidth, ceremony.metrics.edge),
+                RankColour(1), ceremony.title.rightWidth > 0);
+            y += headerHeight + gap;
+            y += WrappedHeight(g_context, gap, y, contentWidth) + 2 * gap;
+            if (resultCount > 0)
+            {
+                int heights[3] = {};
+                int maximumHeight = 0;
+                if (ceremony.podium.stacked)
+                {
+                    for (int p = 0; p < ceremony.podium.count; ++p)
+                    {
+                        const LeaderboardLayout::PodiumSlot& geometry =
+                            ceremony.podium.slots[p];
+                        PodiumSlot& slot = g_slots[geometry.sourceIndex];
+                        heights[p] = LayoutResultCard(
+                            slot, gap + geometry.left, y,
+                            geometry.width, geometry.portrait,
+                            gap, body, ceremony.metrics.edge);
+                        y += heights[p] + gap;
+                    }
+                }
+                else
+                {
+                    for (int p = 0; p < ceremony.podium.count; ++p)
+                    {
+                        const LeaderboardLayout::PodiumSlot& geometry =
+                            ceremony.podium.slots[p];
+                        PodiumSlot& slot = g_slots[geometry.sourceIndex];
+                        heights[p] = LayoutResultCard(
+                            slot, gap + geometry.left, y,
+                            geometry.width, geometry.portrait,
+                            gap, body, ceremony.metrics.edge);
+                        maximumHeight = Max(maximumHeight, heights[p]);
+                    }
+                    for (int p = 0; p < ceremony.podium.count; ++p)
+                    {
+                        const LeaderboardLayout::PodiumSlot& geometry =
+                            ceremony.podium.slots[p];
+                        g_slots[geometry.sourceIndex].root->setPosition(
+                            gap + geometry.left,
+                            y + maximumHeight - heights[p]);
+                    }
+                    y += maximumHeight + gap;
+                }
+            }
+            if (g_empty->getVisible()) y += WrappedHeight(g_empty, gap, y, contentWidth) + gap;
+            g_contentHeight = y;
+            g_scroll->setCanvasSize(Max(1, view.width), Max(y, view.height));
+            if (g_scroll->getViewCoord().width == view.width) break;
+        }
+        const int maximum = Max(0, g_contentHeight - g_scroll->getViewCoord().height);
+        g_scroll->setViewOffset(MyGUI::IntPoint(0, -Min(maximum, Max(0, oldOffset))));
+        g_clientSize = size;
+        g_fontHeight = body;
+    }
+    bool EnsureWindow()
+    {
+        if (g_window) return true;
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (!gui) return false;
+        const char* resource = "Kenshi_WindowCX";
+        try
+        {
+            g_window = gui->createWidgetReal<MyGUI::Window>(resource,
+                .08f, .09f, .84f, .82f, MyGUI::Align::Center,
+                "Window", "ProvingGroundsResultsWindow");
+            g_window->setCaption("Proving Grounds - Results");
+            g_window->setVisible(false);
+            g_window->eventWindowButtonPressed += MyGUI::newDelegate(OnWindowButtonPressed);
+            MyGUI::Widget* client = g_window->getClientWidget();
+            if (!client) throw std::runtime_error("window has no client widget");
+            const MyGUI::IntCoord initial(0, 0, 100, 24);
+            resource = "Kenshi_TextboxStandardText";
+            g_measure = NativeUI::Label(client, initial, "PG_ResultsMeasure", "Match complete");
+            g_measure->setVisible(false);
+            resource = "Kenshi_ScrollView";
+            g_scroll = NativeUI::Scroll(client, MyGUI::IntCoord(0, 0, 300, 200), "PG_ResultsScroll");
+            resource = "Kenshi_WordWrapEmpty";
+            g_header = NativeUI::WrappedLabel(g_scroll, initial, "PG_ResultsHeader", "");
+            g_context = NativeUI::WrappedLabel(g_scroll, initial, "PG_ResultsContext", "");
+            g_empty = NativeUI::WrappedLabel(g_scroll, initial, "PG_ResultsEmpty",
+                "No victor\nThe match ended without a podium.");
+            g_header->setTextAlign(MyGUI::Align::Center | MyGUI::Align::VCenter);
+            g_header->setTextColour(RankColour(1));
+            g_context->setTextAlign(MyGUI::Align::Center | MyGUI::Align::Top);
+            g_empty->setTextAlign(MyGUI::Align::Center | MyGUI::Align::Top);
+            BindWheel(g_header);
+            BindWheel(g_context);
+            BindWheel(g_empty);
+            g_headerRails[0] = OptionalAccent(g_scroll, initial,
+                "PG_ResultsHeaderRailLeft", .42f);
+            g_headerRails[1] = OptionalAccent(g_scroll, initial,
+                "PG_ResultsHeaderRailRight", .42f);
+            for (int i = 0; i < 3; ++i)
+            {
+                char name[64];
+                sprintf_s(name, "PG_ResultsSlot_%d", i);
+                const std::string prefix(name);
+                PodiumSlot& slot = g_slots[i];
+                resource = "PanelEmpty";
+                slot.root = g_scroll->createWidget<MyGUI::Widget>(resource, initial, MyGUI::Align::Default, prefix);
+                resource = "ImageBox";
+                slot.portrait = slot.root->createWidget<MyGUI::ImageBox>(resource, initial,
+                    MyGUI::Align::Default, prefix + "_Portrait");
+                slot.portrait->setVisible(false);
+                resource = "Kenshi_TextboxStandardText";
+                slot.placeholder = NativeUI::Label(
+                    slot.root, initial, prefix + "_PortraitPlaceholder", "?");
+                slot.placeholder->setTextAlign(
+                    MyGUI::Align::Center | MyGUI::Align::VCenter);
+                slot.rankLabel = NativeUI::Label(slot.root, initial, prefix + "_Rank", "");
+                resource = "Kenshi_WordWrapEmpty";
+                slot.nameLabel = NativeUI::WrappedLabel(slot.root, initial, prefix + "_Name", "");
+                slot.statsLabel = NativeUI::WrappedLabel(slot.root, initial, prefix + "_Stats", "");
+                BindWheel(slot.root);
+                BindWheel(slot.portrait);
+                BindWheel(slot.placeholder);
+                BindWheel(slot.rankLabel);
+                BindWheel(slot.nameLabel);
+                BindWheel(slot.statsLabel);
+                for (int edge = 0; edge < 4; ++edge)
+                {
+                    slot.portraitBorder[edge] = OptionalAccent(
+                        slot.root, initial,
+                        prefix + "_PortraitBorder" +
+                            static_cast<char>('0' + edge), .82f);
+                    slot.cardBorder[edge] = OptionalAccent(
+                        slot.root, initial,
+                        prefix + "_CardBorder" +
+                            static_cast<char>('0' + edge), .28f);
+                }
+            }
+            resource = "Kenshi_Button1";
+            g_closeBtn = NativeUI::Button(client, initial, "PG_ResultsClose", "Close results");
+            g_closeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnCloseClicked);
+            return true;
+        }
+        catch (const std::exception& error)
+        {
+            PGLog::Error(std::string("Proving Grounds: native results creation failed at ") + resource + ": " + error.what());
+        }
+        catch (...)
+        {
+            PGLog::Error(std::string("Proving Grounds: native results creation failed at ") + resource);
+        }
+        AbandonWindow();
+        return false;
     }
 
     const char* PlaceCaption(MatchRules::MatchMode mode, int place)
@@ -547,12 +506,10 @@ namespace
     {
         PodiumSlot& slot = g_slots[slotIndex];
         SetSlotVisible(slot, true);
+        slot.place = entry.place;
 
-        const MyGUI::Colour rankColour =
-            entry.place == 1 ? kAmber : (entry.place == 2 ? kSilver : kBronze);
         slot.rankLabel->setCaption(PlaceCaption(mode, entry.place));
-        slot.rankLabel->setTextColour(rankColour);
-        TintWidget(slot.rankLabel, rankColour);
+        slot.rankLabel->setTextColour(RankColour(entry.place));
 
         char nameLine[96];
         const char* team = TeamCaption(entry.fighter.team);
@@ -561,15 +518,17 @@ namespace
         else
             sprintf_s(nameLine, "%s", entry.fighter.name);
         slot.nameLabel->setCaption(nameLine);
+        slot.placeholder->setCaption(
+            ResultsLayout::PortraitInitialUtf8(entry.fighter.name));
 
         char statsLine[256];
         if (entry.fighter.ratingUpdated)
         {
             sprintf_s(
                 statsLine,
-                "DEALT  %.0f     TAKEN  %.0f     MITIGATED  %.0f\n"
-                "HITS %d   BLOCKS %d   MISSES %d   DODGES %d\n"
-                "RATING  %.1f  (%+.1f)",
+                "DEALT %.0f  \xE2\x80\xA2  TAKEN %.0f  \xE2\x80\xA2  MITIGATED %.0f\n"
+                "HITS %d  \xE2\x80\xA2  BLOCKS %d  \xE2\x80\xA2  MISSES %d  \xE2\x80\xA2  DODGES %d\n"
+                "RATING %.1f (%+.1f)  \xE2\x80\xA2  MARKS %d (+%d)",
                 entry.fighter.damageDealt,
                 entry.fighter.damageTaken,
                 entry.fighter.damageMitigated,
@@ -578,14 +537,16 @@ namespace
                 entry.fighter.misses,
                 entry.fighter.dodges,
                 entry.fighter.ratingAfter,
-                entry.fighter.ratingDelta);
+                entry.fighter.ratingDelta,
+                entry.fighter.marksAfter,
+                entry.fighter.marksEarned);
         }
         else
         {
             sprintf_s(
                 statsLine,
-                "DEALT  %.0f     TAKEN  %.0f     MITIGATED  %.0f\n"
-                "HITS %d   BLOCKS %d   MISSES %d   DODGES %d",
+                "DEALT %.0f  \xE2\x80\xA2  TAKEN %.0f  \xE2\x80\xA2  MITIGATED %.0f\n"
+                "HITS %d  \xE2\x80\xA2  BLOCKS %d  \xE2\x80\xA2  MISSES %d  \xE2\x80\xA2  DODGES %d",
                 entry.fighter.damageDealt,
                 entry.fighter.damageTaken,
                 entry.fighter.damageMitigated,
@@ -596,19 +557,20 @@ namespace
         }
         slot.statsLabel->setCaption(statsLine);
 
-        BindPortrait(slot.portrait, character);
+        slot.portraitAvailable = BindPortrait(slot.portrait, character);
     }
 
     void ShowFromSnapshot(const SparPodium::Snapshot& snapshot)
     {
-        EnsureWindow();
+        if (!EnsureWindow()) return;
         if (!g_window || !g_header || !g_context)
         {
-            DebugLog("Proving Grounds: results UI missing widgets");
+            PGLog::Debug("Proving Grounds: results UI missing widgets");
             return;
         }
 
         g_header->setCaption(snapshot.header[0] ? snapshot.header : "Match ended");
+        g_measure->setCaption(g_header->getCaption());
 
         char context[128];
         sprintf_s(
@@ -632,10 +594,11 @@ namespace
         if (g_empty)
             g_empty->setVisible(snapshot.podiumCount == 0);
 
-        // Re-apply in case the first window creation preceded GUI resource setup.
-        ApplyResultsTexture();
+        g_scroll->setViewOffset(MyGUI::IntPoint(0, 0));
+        FitWindowToContent(true);
+        LayoutWindow();
         g_window->setVisible(true);
-        DebugLog("Proving Grounds: results podium shown");
+        PGLog::Debug("Proving Grounds: results podium shown");
     }
 }
 
@@ -646,10 +609,10 @@ namespace ResultsUI
         if (!SparStats::HasSnapshot())
             return;
         g_pending = true;
-        g_delaySec = delaySec > 0.0f ? delaySec : 0.8f;
+        g_delaySec = delaySec > 0.0f ? delaySec : 1.0f;
         g_elapsedSec = 0.0f;
         g_lastTick = GetTickCount();
-        DebugLog("Proving Grounds: results UI scheduled");
+        PGLog::Debug("Proving Grounds: results UI scheduled");
     }
 
     void Cancel()
@@ -672,6 +635,20 @@ namespace ResultsUI
 
     void Tick()
     {
+        if (IsVisible())
+        {
+            try
+            {
+                FitWindowToContent();
+                if (g_window->getClientWidget()->getSize() != g_clientSize || BodyHeight() != g_fontHeight)
+                    LayoutWindow();
+            }
+            catch (...)
+            {
+                PGLog::Error("Proving Grounds: native results resize failed");
+                AbandonWindow();
+            }
+        }
         if (!g_pending)
             return;
 
@@ -685,6 +662,13 @@ namespace ResultsUI
 
         g_pending = false;
         if (SparStats::HasSnapshot())
-            ShowFromSnapshot(SparStats::GetSnapshot());
+        {
+            try { ShowFromSnapshot(SparStats::GetSnapshot()); }
+            catch (...)
+            {
+                PGLog::Error("Proving Grounds: native results content failed (ImageBox/Kenshi_WordWrapEmpty)");
+                AbandonWindow();
+            }
+        }
     }
 }

@@ -11,22 +11,34 @@ namespace MatchRules
         return true; // LastStanding
     }
 
-    static bool TeamAllDown(const MatchParticipant* list, int count, MatchTeam team, bool honorEliminated)
+    // Returns true when a team counts as defeated. downedPercent 0 requires every
+    // member to be down (shipped behaviour); a positive value ends the team once
+    // that percentage is down.
+    static bool TeamDown(const MatchParticipant* list, int count, MatchTeam team,
+        bool honorEliminated, int downedPercent)
     {
-        bool any = false;
+        int total = 0;
+        int down = 0;
         for (int i = 0; i < count; ++i)
         {
             if (list[i].team != team)
                 continue;
-            any = true;
+            ++total;
             const bool up = list[i].conscious && !(honorEliminated && list[i].eliminated);
-            if (up)
-                return false;
+            if (!up)
+                ++down;
         }
-        return any;
+        if (total <= 0)
+            return false;
+        if (downedPercent <= 0)
+            return down == total;
+        // Integer comparison, so a 1-fighter team ends at down == 1 for any
+        // threshold and a 4-fighter team at 50% ends at down == 2.
+        return down * 100 >= downedPercent * total;
     }
 
-    MatchEndKind EvaluateEnd(MatchMode mode, const MatchParticipant* list, int count)
+    MatchEndKind EvaluateEnd(MatchMode mode, const MatchParticipant* list, int count,
+        int downedPercent)
     {
         if (!list || count <= 0)
             return EndNone;
@@ -34,8 +46,8 @@ namespace MatchRules
         if (mode == ModeTeamAvB || mode == ModeTeams1v1)
         {
             const bool honorEliminated = (mode == ModeTeams1v1);
-            const bool aDown = TeamAllDown(list, count, TeamA, honorEliminated);
-            const bool bDown = TeamAllDown(list, count, TeamB, honorEliminated);
+            const bool aDown = TeamDown(list, count, TeamA, honorEliminated, downedPercent);
+            const bool bDown = TeamDown(list, count, TeamB, honorEliminated, downedPercent);
             if (aDown && bDown)
                 return EndDraw;
             if (aDown)

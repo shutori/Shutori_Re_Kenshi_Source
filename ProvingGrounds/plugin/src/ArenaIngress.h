@@ -12,7 +12,8 @@ namespace ArenaIngress
     enum LocationMode
     {
         LocationArena = 0,
-        LocationBanner = 1
+        LocationSmallArena = 1,
+        LocationBanner = 2
     };
 
     void BindRegistry(RootObject* registry);
@@ -34,6 +35,9 @@ namespace ArenaIngress
     bool BeginApproachForUI(Building* building);
     void NotifyExternalOrder(Character* fighter);
 
+    // Character who opened the Registry/Banner UI approach (primary selection).
+    Character* GetUiOpener();
+
     bool Begin(MatchRules::MatchMode mode, Character** fighters, MatchRules::MatchTeam* teams, int count);
     bool Begin(
         MatchRules::MatchMode mode,
@@ -41,14 +45,19 @@ namespace ArenaIngress
         MatchRules::MatchTeam* teams,
         int count,
         Character** escorts,
-        int escortCount);
+        int escortCount,
+        Building* siteOverride = 0);
     void Cancel();
     void Tick();
 
     // Teams 1v1 replacement: walk a bench fighter to their side's pit marker.
     bool BeginWalkIn(Character* fighter, MatchRules::MatchTeam team);
     bool IsWalkInPending();
+    Character* GetWalkInFighter();
     bool IsWalkInArrived();
     void TickWalkIn();
     void ClearWalkIn();
+
+    // Load/teardown path: clear pointers and handles without touching objects.
+    void AbandonWorldState();
 }

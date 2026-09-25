@@ -79,6 +79,11 @@ namespace
 
 namespace SparStats
 {
+    void AbandonWorldState()
+    {
+        ResetForMatch();
+    }
+
     void ResetForMatch()
     {
         g_live.clear();

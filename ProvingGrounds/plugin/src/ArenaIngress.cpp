@@ -1,4 +1,10 @@
 #include "ArenaIngress.h"
+#include "ArenaRingGuard.h"
+#include "TownArena.h"
+#include "TownAnnouncer.h"
+#include "TownAnnouncerPolicy.h"
+#include "TownBookie.h"
+#include "ArenaIngressPolicy.h"
 #include "ArenaIdentity.h"
 #include "ArenaUI.h"
 #include "FightStarter.h"
@@ -8,7 +14,7 @@
 #include "SparSession.h"
 #include "SquadUtil.h"
 
-#include <Debug.h>
+#include "PGLog.h"
 
 #include <Windows.h>
 
@@ -59,6 +65,9 @@ namespace
         Ogre::Vector3( 120.0f, 0.0f, -40.0f),
     };
     static const int kArenaBenchCount = 3;
+    // Compact arena uses the same layout at half scale. Keep this separate
+    // from the full arena values so it can be tuned against the placed model.
+    static const float kSmallArenaScale = 0.5f;
     static const float kBannerGatherOffset = 20.0f;
     static const float kBannerBenchExtra = 18.0f;
     static const float kArenaLastStandingInnerRadius = 60.0f;
@@ -81,11 +90,11 @@ namespace
     // Fight formations need a tighter gate than walking up to the Registry.
     // Otherwise everyone can still be near the middle when combat is engaged.
     static const float kFormationArrivalRadius = 30.0f;
-    static const float kFormationSettleRadius = 45.0f;
-    static const float kHandlerArrivalRadius = 60.0f;
     static const float kSettleSpeed = 0.35f;
     static const float kSettleHoldSec = 0.8f;
     static const float kIngressTimeoutSec = 20.0f;
+    static const float kNpcFormationTimeoutSec = 30.0f;
+    static const float kFightGatherHoldSec = 4.0f;
     static const float kFightCountdownSec = 2.25f;
     // RMB mouse-up cancels orders issued on the same click — wait it out, then keep re-issuing.
     static const float kApproachFirstMoveDelaySec = 0.35f;
@@ -101,9 +110,10 @@ namespace
     enum PendingKind
     {
         PendingNone = 0,
-        PendingFight = 1,
-        PendingOpenUI = 2,
-        PendingCountdown = 3
+        PendingPrisonerRelease = 1,
+        PendingFormation = 2,
+        PendingOpenUI = 3,
+        PendingCountdown = 4
     };
 
     hand g_boundRegistry;
@@ -129,6 +139,7 @@ namespace
     std::vector<MatchRules::MatchTeam> g_teams;
     std::vector<Character*> g_escorts;
     std::vector<Ogre::Vector3> g_targets;
+    Character* g_uiOpener = NULL;
     std::string g_status = "Idle";
     bool g_issuingManagedMove = false;
 
@@ -179,7 +190,7 @@ namespace
         sprintf_s(buf, "Proving Grounds: site search hits=%d matched=%d bestDistXZ=%.1f (radius=%.0f)",
             static_cast<int>(results.size()), matchCount,
             best ? sqrtf(bestDist) : -1.0f, kSiteSearchRadius);
-        DebugLog(buf);
+        PGLog::Debug(buf);
 
         return best;
     }
@@ -201,6 +212,8 @@ namespace
     {
         if (mode == ArenaIngress::LocationBanner)
             return FindNearestMatching(origin, &ArenaIdentity::IsBanner);
+        if (mode == ArenaIngress::LocationSmallArena)
+            return FindNearestMatching(origin, &ArenaIdentity::IsSmallArena);
         return FindNearestMatching(origin, &ArenaIdentity::IsArena);
     }
 
@@ -254,7 +267,8 @@ namespace
         MatchRules::MatchTeam* teams,
         int count,
         Building* arena,
-        std::vector<Ogre::Vector3>& targets)
+        std::vector<Ogre::Vector3>& targets,
+        float scale = 1.0f)
     {
         targets.resize(static_cast<size_t>(count));
         const int half = kArenaMarkerCount / 2;
@@ -269,17 +283,17 @@ namespace
                 if (teams[i] == MatchRules::TeamA)
                 {
                     if (aSlot == 0)
-                        local = kArenaMarkers[0];
+                        local = kArenaMarkers[0] * scale;
                     else
-                        local = kArenaBenchA[(aSlot - 1) % kArenaBenchCount];
+                        local = kArenaBenchA[(aSlot - 1) % kArenaBenchCount] * scale;
                     ++aSlot;
                 }
                 else
                 {
                     if (bSlot == 0)
-                        local = kArenaMarkers[half];
+                        local = kArenaMarkers[half] * scale;
                     else
-                        local = kArenaBenchB[(bSlot - 1) % kArenaBenchCount];
+                        local = kArenaBenchB[(bSlot - 1) % kArenaBenchCount] * scale;
                     ++bSlot;
                 }
                 targets[static_cast<size_t>(i)] = LocalToWorld(arena, local);
@@ -297,8 +311,8 @@ namespace
                         ScrambleOffset(
                             i,
                             count,
-                            kArenaLastStandingInnerRadius,
-                            kArenaLastStandingOuterRadius));
+                            kArenaLastStandingInnerRadius * scale,
+                            kArenaLastStandingOuterRadius * scale));
             }
             return;
         }
@@ -324,9 +338,9 @@ namespace
                 teams[i],
                 slot,
                 teamCount,
-                kArenaTeamSideOffset,
-                kArenaTeamColumnSpacing,
-                kArenaTeamRowSpacing);
+                kArenaTeamSideOffset * scale,
+                kArenaTeamColumnSpacing * scale,
+                kArenaTeamRowSpacing * scale);
             targets[static_cast<size_t>(i)] = LocalToWorld(arena, local);
         }
     }
@@ -404,6 +418,9 @@ namespace
         if (!c || !c->isValid())
             return;
 
+        // Town package goals can otherwise immediately reclaim a trial fighter.
+        if (TownArena::IsFighter(c)) c->clearAllAIGoals();
+
         // Hold/Passive ignore move tasks; clear so pathing actually starts.
         c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, false);
         c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, false);
@@ -416,6 +433,11 @@ namespace
         c->addOrder(NULL, MOVE_CUS_ORDERED, NULL, false, true, loc);
         g_issuingManagedMove = false;
         c->setDestination(loc, false);
+        if (movement && TownArena::IsFighter(c))
+        {
+            movement->setDesiredSpeedOrders(RUN);
+            movement->setDesiredSpeed(RUN);
+        }
     }
 
     void IssueRun(Character* c, const Ogre::Vector3& loc)
@@ -438,7 +460,7 @@ namespace
         for (size_t i = 0; i < count; ++i)
             IssueMove(g_fighters[i], g_targets[i]);
 
-        DebugLog("Proving Grounds: approach move (re)issued");
+        PGLog::Debug("Proving Grounds: approach move (re)issued");
     }
 
     // Walk to interact point. Prefer Kenshi usage/position marker (exposed use node),
@@ -558,10 +580,103 @@ namespace
         }
     }
 
-    void ClearPendingState()
+    void ParkCharacterInPlace(Character* c)
+    {
+        if (!c || !c->isValid() || c->isDead())
+            return;
+
+        c->removeJob(MOVE_CUS_ORDERED);
+        c->clearAllAIGoals();
+        c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, true);
+        c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, true);
+        c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, false);
+        if (PrisonerUtil::IsMatchPrisoner(c) || TownArena::IsFighter(c))
+        {
+            // HOLD is only a player standing order; released NPC packages can
+            // immediately rebuild Patrolling after the rethink below. Give
+            // prisoner fighters an explicit active goal for staging instead.
+            c->addGoal(STAND_STILL, NULL);
+        }
+        c->reThinkCurrentAIAction();
+    }
+
+    bool FighterAtMark(size_t index, float radius)
+    {
+        if (index >= g_fighters.size() || index >= g_targets.size())
+            return false;
+        Character* c = g_fighters[index];
+        if (!c || !c->isValid())
+            return false;
+        const float radiusSq = radius * radius;
+        return HorizontalDistSq(c->getPosition(), g_targets[index]) <= radiusSq;
+    }
+
+    void ParkArrivedFighters()
+    {
+        for (size_t i = 0; i < g_fighters.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            if (!fighter || !fighter->isValid())
+                continue;
+            if (PrisonerUtil::IsMatchPrisoner(fighter) &&
+                !PrisonerUtil::IsMatchPrisonerReleased(fighter))
+            {
+                continue;
+            }
+            if (!FighterAtMark(i, kFormationArrivalRadius))
+                continue;
+
+            ParkCharacterInPlace(fighter);
+        }
+    }
+
+    int CountFightersOutsideFormation()
+    {
+        int outside = 0;
+        for (size_t i = 0; i < g_fighters.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            if (!fighter || !fighter->isValid() ||
+                !FighterAtMark(i, kFormationArrivalRadius))
+            {
+                ++outside;
+            }
+        }
+        return outside;
+    }
+
+    void IssueFormationMoves()
+    {
+        for (size_t i = 0; i < g_fighters.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            if (!fighter || !fighter->isValid() || fighter->isDead())
+                continue;
+
+            const bool prisoner = PrisonerUtil::IsMatchPrisoner(fighter);
+            if (prisoner && !PrisonerUtil::IsMatchPrisonerReleased(fighter))
+                continue;
+            if (FighterAtMark(i, kFormationArrivalRadius))
+                continue;
+
+            if (prisoner)
+            {
+                PrisonerUtil::SendPairToArena(fighter, g_targets[i]);
+            }
+            else
+            {
+                IssueMove(fighter, g_targets[i]);
+            }
+        }
+    }
+
+    void ClearPendingState(bool restoreFighterOrders = true)
     {
         const bool restoreFightState =
-            g_pendingKind == PendingFight || g_pendingKind == PendingCountdown;
+            restoreFighterOrders &&
+            (g_pendingKind == PendingPrisonerRelease ||
+             g_pendingKind == PendingFormation ||
+             g_pendingKind == PendingCountdown);
         for (size_t i = 0; i < g_fighters.size(); ++i)
         {
             Character* c = g_fighters[i];
@@ -580,6 +695,7 @@ namespace
                 g_fighters.data(),
                 static_cast<int>(g_fighters.size()));
         }
+        TownAnnouncer::Release();
         g_pending = false;
         g_pendingKind = PendingNone;
         g_nextMoveIssueSec = 0.0f;
@@ -616,49 +732,59 @@ namespace
         g_elapsedSec = 0.0f;
         g_countdownStage = -1;
         g_lastTick = GetTickCount();
-        g_status = "Fight starts in 3...";
-        ShowFighterCountdown(3, "3");
-        DebugLog("Proving Grounds: pre-fight countdown started");
+        g_status = TownAnnouncer::HasAnnouncement()
+            ? "The announcer takes the rail"
+            : "Fight starts in 3...";
+        ParkArrivedFighters();
+        for (size_t i = 0; i < g_fighters.size(); ++i)
+            ParkCharacterInPlace(g_fighters[i]);
+        if (g_pendingKind == PendingPrisonerRelease)
+            PrisonerUtil::ParkMatchHandlers();
+        if (TownAnnouncer::HasAnnouncement())
+            TownAnnouncer::BeginAnnouncement();
+        else
+            ShowFighterCountdown(3, "3");
+        PGLog::Debug("Proving Grounds: pre-fight countdown started");
     }
 
-    bool AllWithinRadius(float radius)
+    ArenaIngressPolicy::IngressObservation BuildIngressObservation()
     {
-        if (!PrisonerUtil::AllMatchPrisonersReleased())
-            return false;
+        ArenaIngressPolicy::IngressObservation observation = {};
+        observation.allPrisonersReleased = PrisonerUtil::AllMatchPrisonersReleased();
+        observation.allFightersValid = true;
+        observation.allAtArrivalRadius = observation.allPrisonersReleased;
+        observation.allAtSettleRadius = observation.allPrisonersReleased;
+        observation.allAtFormationRadius = observation.allPrisonersReleased;
+        observation.allSettled = observation.allPrisonersReleased;
 
-        const float radiusSq = radius * radius;
-        const int count = static_cast<int>(g_fighters.size());
-        for (int i = 0; i < count; ++i)
+        const float arrivalRadiusSq = kArrivalRadius * kArrivalRadius;
+        const float settleRadiusSq = kSettleRadius * kSettleRadius;
+        const float formationRadiusSq =
+            kFormationArrivalRadius * kFormationArrivalRadius;
+        for (size_t i = 0; i < g_fighters.size(); ++i)
         {
-            Character* c = g_fighters[static_cast<size_t>(i)];
+            Character* c = g_fighters[i];
             if (!c || !c->isValid())
-                return false;
-            if (HorizontalDistSq(c->getPosition(), g_targets[static_cast<size_t>(i)]) > radiusSq)
-                return false;
-        }
-        return true;
-    }
+            {
+                observation.allFightersValid = false;
+                observation.allAtArrivalRadius = false;
+                observation.allAtSettleRadius = false;
+                observation.allAtFormationRadius = false;
+                observation.allSettled = false;
+                continue;
+            }
 
-    bool AllArrived()
-    {
-        return AllWithinRadius(kArrivalRadius);
-    }
-
-    bool AllSettledNearTargets(float radius)
-    {
-        if (!AllWithinRadius(radius))
-            return false;
-
-        const int count = static_cast<int>(g_fighters.size());
-        for (int i = 0; i < count; ++i)
-        {
-            Character* c = g_fighters[static_cast<size_t>(i)];
-            if (!c || !c->isValid())
-                return false;
+            const float distanceSq = HorizontalDistSq(c->getPosition(), g_targets[i]);
+            if (distanceSq > arrivalRadiusSq)
+                observation.allAtArrivalRadius = false;
+            if (distanceSq > settleRadiusSq)
+                observation.allAtSettleRadius = false;
+            if (distanceSq > formationRadiusSq)
+                observation.allAtFormationRadius = false;
             if (c->getMovementSpeed() > kSettleSpeed)
-                return false;
+                observation.allSettled = false;
         }
-        return true;
+        return observation;
     }
 
     bool AnyFighterInvalid()
@@ -683,12 +809,15 @@ namespace
 
     void FinishIngressAndStart()
     {
+        // Ingress ticks before TownArena. Revalidate the locked NPCs before
+        // clearing staging ownership or allowing StartMatch to begin combat.
+        if (!TownArena::ValidatePreparation()) return;
         const int count = static_cast<int>(g_fighters.size());
         MatchRules::MatchMode mode = g_mode;
         std::vector<Character*> fighters = g_fighters;
         std::vector<MatchRules::MatchTeam> teams = g_teams;
 
-        ClearPendingState();
+        ClearPendingState(false);
 
         if (count < 2 || fighters.empty() || teams.empty())
         {
@@ -699,7 +828,12 @@ namespace
         const bool ok = SparSession::StartMatch(mode, fighters.data(), teams.data(), count);
         g_status = SparSession::GetStatus();
         if (!ok)
-            DebugLog(("Proving Grounds: ingress StartMatch failed: " + g_status).c_str());
+        {
+            // ClearPendingState(false) transferred ownership to StartMatch.
+            // A rejected start must still release the saved staging orders.
+            FightStarter::DisengageMatch(fighters.data(), count);
+            PGLog::Debug(("Proving Grounds: ingress StartMatch failed: " + g_status).c_str());
+        }
         else if (PrisonerUtil::MatchIncludesPrisoner())
             PrisonerUtil::ParkMatchHandlers();
     }
@@ -714,24 +848,82 @@ namespace
         {
             ArenaUI::ShowFromRegistry(registry);
             g_status = ArenaIngress::GetStatus();
-            DebugLog("Proving Grounds: approach complete -> Arena UI");
+            PGLog::Debug("Proving Grounds: approach complete -> Arena UI");
             return;
         }
 
-        if (board && ArenaIdentity::IsLeaderboardFinished(board))
+        LeaderboardData::Kind leaderboard = LeaderboardData::Player;
+        if (board && ArenaIdentity::GetFinishedLeaderboardKind(
+                board, leaderboard))
         {
-            LeaderboardUI::Show();
-            g_status = "Leaderboard open";
-            DebugLog("Proving Grounds: approach complete -> Leaderboard UI");
+            LeaderboardUI::Show(leaderboard, board);
+            g_status = leaderboard == LeaderboardData::Town
+                ? "Town leaderboard open"
+                : "Player leaderboard open";
+            PGLog::Debug(leaderboard == LeaderboardData::Town
+                ? "Proving Grounds: approach complete -> Town Leaderboard UI"
+                : "Proving Grounds: approach complete -> Player Leaderboard UI");
             return;
         }
 
         g_status = "Interact building lost during approach";
     }
+
+    bool OpenInteractUiImmediately(Building* building)
+    {
+        if (ArenaIdentity::IsMatchUiOpenerFinished(building))
+        {
+            ArenaUI::ShowFromRegistry(
+                building,
+                ArenaIngressPolicy::ShouldBindInteractSource(true));
+            PGLog::Debug("Proving Grounds: busy match Registry/Banner UI opened immediately");
+            return true;
+        }
+
+        LeaderboardData::Kind leaderboard = LeaderboardData::Player;
+        if (ArenaIdentity::GetFinishedLeaderboardKind(building, leaderboard))
+        {
+            LeaderboardUI::Show(leaderboard, building);
+            PGLog::Debug(leaderboard == LeaderboardData::Town
+                ? "Proving Grounds: busy match Town Leaderboard UI opened immediately"
+                : "Proving Grounds: busy match Player Leaderboard UI opened immediately");
+            return true;
+        }
+        return false;
+    }
 }
 
 namespace ArenaIngress
 {
+    void AbandonWorldState()
+    {
+        TownAnnouncer::AbandonWorldState();
+        g_boundRegistry.setNull();
+        g_boundLeaderboard.setNull();
+        g_boundSite.setNull();
+        g_pending = false;
+        g_pendingKind = PendingNone;
+        g_nextMoveIssueSec = 0.0f;
+        g_elapsedSec = 0.0f;
+        g_settleHoldSec = 0.0f;
+        g_countdownStage = -1;
+        g_lastTick = 0;
+        g_escortsParkIssued = false;
+        g_walkInPending = false;
+        g_walkInFighter = NULL;
+        g_walkInTarget = Ogre::Vector3(0.0f, 0.0f, 0.0f);
+        g_walkInNextMoveSec = 0.0f;
+        g_walkInElapsedSec = 0.0f;
+        g_walkInLastTick = 0;
+        g_fighters.clear();
+        g_teams.clear();
+        g_escorts.clear();
+        g_targets.clear();
+        g_uiOpener = NULL;
+        g_issuingManagedMove = false;
+        g_status = "Idle";
+    }
+
     void BindRegistry(RootObject* registry)
     {
         if (!ArenaIdentity::IsMatchUiOpener(registry))
@@ -775,6 +967,13 @@ namespace ArenaIngress
         return g_boundRegistry.getBuilding();
     }
 
+    Character* GetUiOpener()
+    {
+        if (g_uiOpener && g_uiOpener->isValid())
+            return g_uiOpener;
+        return NULL;
+    }
+
     void SetLocationMode(LocationMode mode)
     {
         g_locationMode = mode;
@@ -807,6 +1006,8 @@ namespace ArenaIngress
     {
         if (g_locationMode == LocationBanner)
             return "No banner placed near registry";
+        if (g_locationMode == LocationSmallArena)
+            return "No small arena placed near registry";
         return "No arena placed near registry";
     }
 
@@ -842,7 +1043,7 @@ namespace ArenaIngress
 
         ClearPendingState();
         g_status = "Approach cancelled by new order";
-        DebugLog("Proving Grounds: UI approach cancelled by player order");
+        PGLog::Debug("Proving Grounds: UI approach cancelled by player order");
     }
 
     bool BeginApproachForUI(Building* building)
@@ -855,15 +1056,14 @@ namespace ArenaIngress
             g_status = "Interact building not finished";
             return false;
         }
-        if (SparSession::IsActive())
+        const bool fightIngressPending = g_pending &&
+            (g_pendingKind == PendingPrisonerRelease ||
+             g_pendingKind == PendingFormation ||
+             g_pendingKind == PendingCountdown);
+        if (ArenaIngressPolicy::ShouldOpenInteractUiImmediately(
+                SparSession::IsActive(), fightIngressPending, g_walkInPending))
         {
-            g_status = "Already sparring";
-            return false;
-        }
-        if (g_pending && g_pendingKind == PendingFight)
-        {
-            g_status = "Already walking to fight site";
-            return false;
+            return OpenInteractUiImmediately(building);
         }
         // Multi-select use fires addOrder once per character — do not restart.
         if (g_pending && g_pendingKind == PendingOpenUI)
@@ -894,6 +1094,7 @@ namespace ArenaIngress
             BindLeaderboardBuilding(building);
 
         g_fighters = selected;
+        g_uiOpener = selected[0];
         g_teams.clear();
         g_targets.resize(selected.size());
         for (size_t i = 0; i < selected.size(); ++i)
@@ -909,13 +1110,13 @@ namespace ArenaIngress
         g_status = isLeaderboard
             ? "Walking to leaderboard..."
             : (isBanner ? "Walking to banner..." : "Walking to registry...");
-        DebugLog(isLeaderboard
+        PGLog::Debug(isLeaderboard
             ? "Proving Grounds: approach Leaderboard for UI started"
             : (isBanner
                 ? "Proving Grounds: approach Banner for UI started"
                 : "Proving Grounds: approach Registry for UI started"));
 
-        if (AllArrived())
+        if (ArenaIngressPolicy::CanOpenApproachUi(BuildIngressObservation()))
         {
             FinishApproachAndOpenUI();
             return true;
@@ -935,8 +1136,14 @@ namespace ArenaIngress
         MatchRules::MatchTeam* teams,
         int count,
         Character** escorts,
-        int escortCount)
+        int escortCount,
+        Building* siteOverride)
     {
+        if (TownArena::IsAftercare())
+        {
+            g_status = "Town medics are clearing the arena";
+            return false;
+        }
         if (!fighters || !teams || count < 2)
         {
             g_status = "Need at least two fighters";
@@ -968,7 +1175,12 @@ namespace ArenaIngress
         }
 
         const Ogre::Vector3 origin = ResolveSearchOrigin(fighters, count);
-        Building* site = FindSiteForMode(g_locationMode, origin);
+        Building* site = siteOverride ? siteOverride : FindSiteForMode(g_locationMode, origin);
+        if (siteOverride && (!siteOverride->isValid() || !ArenaIdentity::IsArena(siteOverride)))
+        {
+            g_status = "Invalid town arena";
+            return false;
+        }
         if (!site)
         {
             g_status = GetMissingLocationMessage();
@@ -989,15 +1201,32 @@ namespace ArenaIngress
             }
         }
         g_boundSite = site;
+        // Jobs off as soon as match start begins walking people in.
         FightStarter::RememberMatchFighters(fighters, count);
+        if (escorts && escortCount > 0)
+            FightStarter::RememberMatchFighters(escorts, escortCount);
 
         ResultsUI::Cancel();
         ResultsUI::Close();
 
         if (g_locationMode == LocationBanner)
             AssignBannerTargets(mode, teams, count, site, g_targets);
-        else
-            AssignArenaTargets(mode, teams, count, site, g_targets);
+        else {
+            const float arenaScale = g_locationMode == LocationSmallArena
+                ? kSmallArenaScale
+                : (!TownArena::IsBusy() ? 0.70f : 1.0f);
+            AssignArenaTargets(
+                mode, teams, count, site, g_targets,
+                arenaScale);
+        }
+
+        // Register the ring the fighters will be contained in. This is the one place
+        // that knows both the site and whether the bout is a banner, so the guard
+        // never has to re-derive either. A banner is boundless: SetArena finds no ring
+        // there and the guard goes inert. Note the staging scale above is the
+        // LAYOUT's, not the arena's size -- the player-run arena stages at 0.70 while
+        // being the same size as the town Crucible.
+        ArenaRingGuard::SetArena(site);
 
         for (int i = 0; i < count; ++i)
         {
@@ -1008,6 +1237,7 @@ namespace ArenaIngress
             {
                 continue;
             }
+            // One move order — jobs are already off so they won't wander to sit.
             IssueMove(g_fighters[static_cast<size_t>(i)], g_targets[static_cast<size_t>(i)]);
         }
 
@@ -1031,12 +1261,16 @@ namespace ArenaIngress
         }
 
         g_pending = true;
-        g_pendingKind = PendingFight;
+        g_pendingKind = PrisonerUtil::MatchIncludesPrisoner()
+            ? PendingPrisonerRelease
+            : PendingFormation;
         g_elapsedSec = 0.0f;
         g_settleHoldSec = 0.0f;
         g_escortsParkIssued = false;
         g_lastTick = GetTickCount();
-        DebugLog("Proving Grounds: location ingress started");
+        PGLog::Debug("Proving Grounds: location ingress started");
+        if (!TownArena::IsBusy())
+            TownArena::CancelPlannedNpcBout("Player match took priority");
         return true;
     }
 
@@ -1058,13 +1292,19 @@ namespace ArenaIngress
             g_status = "Ingress cancelled";
         }
 
-        DebugLog("Proving Grounds: arena ingress cancelled");
+        PGLog::Debug("Proving Grounds: arena ingress cancelled");
     }
 
     void Tick()
     {
         if (!g_pending)
             return;
+        if (TownArena::IsBusy() && ou && ou->isPaused())
+        {
+            g_lastTick = GetTickCount();
+            TownAnnouncer::TickApproach();
+            return;
+        }
 
         if (g_pendingKind == PendingCountdown)
         {
@@ -1079,6 +1319,29 @@ namespace ArenaIngress
             const float dt = static_cast<float>(now - g_lastTick) / 1000.0f;
             g_lastTick = now;
             g_elapsedSec += dt;
+
+            // Keep everyone frozen so sit-around jobs can't pull them away.
+            for (size_t i = 0; i < g_fighters.size(); ++i)
+                ParkCharacterInPlace(g_fighters[i]);
+            if (PrisonerUtil::MatchIncludesPrisoner())
+                PrisonerUtil::ReinforceParkedHandlers();
+
+            if (TownAnnouncer::HasAnnouncement())
+            {
+                TownAnnouncer::TickAnnouncement(g_elapsedSec);
+                if (TownAnnouncer::HasAnnouncement())
+                {
+                    g_status = TownAnnouncer::GetStatus();
+                    if (g_elapsedSec >= TownAnnouncer::AnnouncementDuration())
+                        FinishIngressAndStart();
+                    return;
+                }
+                // A lost speaker switches to the legacy countdown so the
+                // staged fight cannot remain blocked.
+                g_elapsedSec = TownAnnouncerPolicy::CountdownElapsedAfterFallback(
+                    true, g_elapsedSec);
+                g_countdownStage = -1;
+            }
 
             if (g_elapsedSec < 0.60f)
             {
@@ -1133,19 +1396,28 @@ namespace ArenaIngress
                 g_nextMoveIssueSec = g_elapsedSec + kApproachMoveReissueSec;
             }
 
-            if (AllArrived())
+            const ArenaIngressPolicy::IngressObservation observation =
+                BuildIngressObservation();
+            if (!observation.allFightersValid)
             {
-                DebugLog("Proving Grounds: approach arrival (radius)");
+                ClearPendingState();
+                g_status = "Selection invalid during approach";
+                return;
+            }
+
+            if (ArenaIngressPolicy::CanOpenApproachUi(observation))
+            {
+                PGLog::Debug("Proving Grounds: approach arrival (radius)");
                 FinishApproachAndOpenUI();
                 return;
             }
 
-            if (AllSettledNearTargets(kSettleRadius))
+            if (observation.allAtSettleRadius && observation.allSettled)
             {
                 g_settleHoldSec += dt;
                 if (g_settleHoldSec >= kSettleHoldSec)
                 {
-                    DebugLog("Proving Grounds: approach arrival (settled)");
+                    PGLog::Debug("Proving Grounds: approach arrival (settled)");
                     FinishApproachAndOpenUI();
                     return;
                 }
@@ -1157,7 +1429,7 @@ namespace ArenaIngress
 
             if (g_elapsedSec >= kIngressTimeoutSec)
             {
-                DebugLog("Proving Grounds: approach timeout — opening UI anyway");
+                PGLog::Debug("Proving Grounds: approach timeout — opening UI anyway");
                 FinishApproachAndOpenUI();
             }
             return;
@@ -1167,11 +1439,12 @@ namespace ArenaIngress
         {
             ClearPendingState();
             g_status = "Fight site destroyed during ingress";
-            DebugLog("Proving Grounds: fight site destroyed mid-ingress");
+            PGLog::Debug("Proving Grounds: fight site destroyed mid-ingress");
             return;
         }
 
-        if (AnyFighterInvalid())
+        ArenaIngressPolicy::IngressObservation observation = BuildIngressObservation();
+        if (!observation.allFightersValid)
         {
             Cancel();
             g_status = "Fighter invalid during ingress";
@@ -1182,6 +1455,7 @@ namespace ArenaIngress
         const float dt = static_cast<float>(now - g_lastTick) / 1000.0f;
         g_lastTick = now;
         g_elapsedSec += dt;
+        TownAnnouncer::TickApproach();
 
         if (PrisonerUtil::MatchIncludesPrisoner())
         {
@@ -1191,82 +1465,114 @@ namespace ArenaIngress
                 Character* fighter = g_fighters[i];
                 if (PrisonerUtil::ConsumeNewlyReleased(fighter))
                 {
-                    IssueRun(fighter, g_targets[i]);
-                    PrisonerUtil::EscortHandlerBesidePrisoner(fighter, g_targets[i]);
-                    DebugLog("Proving Grounds: prisoner unlocked — walking to arena");
+                    PrisonerUtil::SendPairToArena(fighter, g_targets[i]);
+                    PGLog::Debug("Proving Grounds: prisoner unlocked — walking to arena");
                 }
             }
 
-            const bool allPrisonersReleased = PrisonerUtil::AllMatchPrisonersReleased();
             if (g_elapsedSec >= g_nextMoveIssueSec)
             {
-                for (size_t i = 0; i < g_fighters.size(); ++i)
-                {
-                    Character* fighter = g_fighters[i];
-                    if (PrisonerUtil::IsMatchPrisoner(fighter))
-                    {
-                        if (!PrisonerUtil::IsMatchPrisonerReleased(fighter))
-                            continue;
-                        IssueRun(fighter, g_targets[i]);
-                        PrisonerUtil::EscortHandlerBesidePrisoner(
-                            fighter, g_targets[i]);
-                    }
-                    else
-                    {
-                        IssueMove(fighter, g_targets[i]);
-                    }
-                }
-                g_nextMoveIssueSec =
-                    g_elapsedSec + kApproachMoveReissueSec;
-                g_status = (g_locationMode == LocationBanner)
-                    ? "Walking to banner..."
-                    : "Walking into arena...";
+                IssueFormationMoves();
+                g_nextMoveIssueSec = g_elapsedSec + kApproachMoveReissueSec;
             }
+            ParkArrivedFighters();
+
+            const bool allPrisonersReleased =
+                PrisonerUtil::AllMatchPrisonersReleased();
             if (!allPrisonersReleased)
             {
                 g_status = "Handlers releasing prisoners...";
                 g_settleHoldSec = 0.0f;
                 return;
             }
+
+            if (ArenaIngressPolicy::ShouldAdvancePrisonerRelease(
+                    g_pendingKind == PendingPrisonerRelease,
+                    PrisonerUtil::MatchIncludesPrisoner(),
+                    allPrisonersReleased))
+            {
+                g_pendingKind = PendingFormation;
+                g_elapsedSec = 0.0f;
+                g_settleHoldSec = 0.0f;
+                g_nextMoveIssueSec = 0.0f;
+                IssueFormationMoves();
+                PGLog::Debug("Proving Grounds: all prisoners released - formation phase started");
+            }
         }
 
-        const bool handlersReady = !PrisonerUtil::MatchIncludesPrisoner() ||
-            PrisonerUtil::AllMatchHandlersReady(kHandlerArrivalRadius);
+        if (g_pendingKind != PendingFormation)
+            return;
 
-        if (handlersReady && AllWithinRadius(kFormationArrivalRadius))
+        if (g_elapsedSec >= g_nextMoveIssueSec)
         {
-            DebugLog("Proving Grounds: ingress arrival (radius)");
+            IssueFormationMoves();
+            g_nextMoveIssueSec = g_elapsedSec + kApproachMoveReissueSec;
+        }
+        ParkArrivedFighters();
+
+        observation = BuildIngressObservation();
+        if (ArenaIngressPolicy::CanBeginCountdown(observation))
+        {
+            if (TownAnnouncer::WaitingForPosition())
+            {
+                g_settleHoldSec = 0.0f;
+                g_status = TownAnnouncer::GetStatus();
+                return;
+            }
+            if (TownBookie::HoldForBets())
+            {
+                g_settleHoldSec = 0.0f;
+                g_status = "NPC fighters ready - bookie accepting bets";
+                return;
+            }
+            g_settleHoldSec += dt;
+            if (g_settleHoldSec < kFightGatherHoldSec)
+            {
+                g_status = "Fighters ready - crowd settling before the match";
+                return;
+            }
+            PGLog::Debug("Proving Grounds: ingress arrival (radius)");
             BeginFightCountdown();
             return;
         }
 
-        if (handlersReady && AllSettledNearTargets(kFormationSettleRadius))
-        {
-            g_settleHoldSec += dt;
-            if (g_settleHoldSec >= kSettleHoldSec)
-            {
-                DebugLog("Proving Grounds: ingress arrival (settled)");
-                BeginFightCountdown();
-                return;
-            }
-        }
-        else
-        {
-            g_settleHoldSec = 0.0f;
-        }
+        g_settleHoldSec = 0.0f;
+        const int outside = CountFightersOutsideFormation();
+        char waiting[128];
+        sprintf_s(waiting, "Waiting for %d fighter%s to reach formation...",
+            outside, outside == 1 ? "" : "s");
+        g_status = waiting;
 
-        if (g_elapsedSec >= kIngressTimeoutSec)
+        // A healthy NPC can occasionally be stranded on disconnected town
+        // navigation. Do not let one actor hold the ambient scheduler forever.
+        if (TownArena::IsBusy() && !TownArena::IsPlayerMatch() &&
+            g_elapsedSec >= kNpcFormationTimeoutSec)
         {
-            if (PrisonerUtil::MatchIncludesPrisoner())
+            for (size_t i = 0; i < g_fighters.size(); ++i)
             {
-                g_status = "Waiting for prisoners and handlers to reach the fight...";
-                g_settleHoldSec = 0.0f;
+                Character* fighter = g_fighters[i];
+                if (!fighter || !fighter->isValid()) continue;
+                const Ogre::Vector3 position = fighter->getPosition();
+                const Ogre::Vector3 target = g_targets[i];
+                const float horizontal = std::sqrt(HorizontalDistSq(position, target));
+                const bool blocked = !FighterAtMark(i, kFormationArrivalRadius);
+                CharMovement* movement = fighter->getMovement();
+                char detail[768];
+                sprintf_s(detail,
+                    "Proving Grounds: ingress timeout fighter slot=%u name=%s blocked=%d horizontal=%.1f vertical=%.1f moving=%d speed=%.2f position=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) destination=(%.1f,%.1f,%.1f)",
+                    static_cast<unsigned>(i + 1), fighter->getName().c_str(), blocked ? 1 : 0,
+                    horizontal, position.y - target.y,
+                    movement && movement->isCurrentlyMoving() ? 1 : 0, fighter->getMovementSpeed(),
+                    position.x, position.y, position.z, target.x, target.y, target.z,
+                    movement ? movement->destination.x : 0.0f,
+                    movement ? movement->destination.y : 0.0f,
+                    movement ? movement->destination.z : 0.0f);
+                PGLog::Debug(detail);
+                if (blocked) TownArena::QuarantineIngressFighter(fighter);
             }
-            else
-            {
-            DebugLog("Proving Grounds: ingress timeout — starting anyway");
-            BeginFightCountdown();
-            }
+            Cancel();
+            g_status = "NPC formation timed out; unreachable fighters excluded and lineup cancelled";
+            PGLog::Debug("Proving Grounds: NPC formation timeout - cancelling lineup for retry");
         }
     }
 
@@ -1292,9 +1598,11 @@ namespace ArenaIngress
         else
         {
             const int half = kArenaMarkerCount / 2;
-            const Ogre::Vector3 local = (team == MatchRules::TeamA)
+            Ogre::Vector3 local = (team == MatchRules::TeamA)
                 ? kArenaMarkers[0]
                 : kArenaMarkers[half];
+            if (g_locationMode == LocationSmallArena)
+                local = local * kSmallArenaScale;
             g_walkInTarget = LocalToWorld(site, local);
         }
 
@@ -1304,8 +1612,13 @@ namespace ArenaIngress
         g_walkInNextMoveSec = 0.0f;
         g_walkInLastTick = GetTickCount();
         IssueMove(fighter, g_walkInTarget);
-        DebugLog("Proving Grounds: Teams 1v1 walk-in started");
+        PGLog::Debug("Proving Grounds: Teams 1v1 walk-in started");
         return true;
+    }
+
+    Character* GetWalkInFighter()
+    {
+        return g_walkInPending ? g_walkInFighter : NULL;
     }
 
     bool IsWalkInPending()

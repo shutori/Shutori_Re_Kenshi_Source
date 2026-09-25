@@ -1,7 +1,10 @@
 #include "FightStarter.h"
+#include "TownArena.h"
+#include "FightDisengagePolicy.h"
 #include "MatchRules.h"
+#include "SparSession.h"
 
-#include <Debug.h>
+#include "PGLog.h"
 #include <vector>
 
 class OrderData;
@@ -38,7 +41,14 @@ namespace
         MoveSpeed moveSpeed;
     };
 
+    struct FocusAssignment
+    {
+        Character* fighter;
+        Character* target;
+    };
+
     std::vector<FighterOrderState> g_originalStates;
+    std::vector<FocusAssignment> g_focusAssignments;
 
     // Native InputHandler command value registered for "toggle_jobs".
     const unsigned int kToggleJobsCommand = 26;
@@ -122,6 +132,45 @@ namespace
     bool IsLivingFighter(Character* c)
     {
         return c && c->isValid() && !c->isDead() && !c->isUnconcious();
+    }
+
+    Character* FindAssignedTarget(Character* fighter)
+    {
+        for (size_t i = 0; i < g_focusAssignments.size(); ++i)
+        {
+            if (g_focusAssignments[i].fighter == fighter)
+                return g_focusAssignments[i].target;
+        }
+        return NULL;
+    }
+
+    void SetAssignedTarget(Character* fighter, Character* target)
+    {
+        if (!fighter)
+            return;
+        for (size_t i = 0; i < g_focusAssignments.size(); ++i)
+        {
+            if (g_focusAssignments[i].fighter != fighter)
+                continue;
+            g_focusAssignments[i].target = target;
+            return;
+        }
+
+        FocusAssignment assignment = {};
+        assignment.fighter = fighter;
+        assignment.target = target;
+        g_focusAssignments.push_back(assignment);
+    }
+
+    void ClearAssignedTarget(Character* fighter)
+    {
+        for (size_t i = 0; i < g_focusAssignments.size(); ++i)
+        {
+            if (g_focusAssignments[i].fighter != fighter)
+                continue;
+            g_focusAssignments.erase(g_focusAssignments.begin() + i);
+            return;
+        }
     }
 
     MatchRules::MatchParticipant MakeParticipant(int index, MatchRules::MatchTeam team, Character* c)
@@ -252,50 +301,111 @@ namespace
         if (!attacker || !target)
             return;
 
-        // Player characters need an actual task order; attackTarget alone is not enough.
+        const bool playerControlled = IsPlayerCharacter(attacker);
         Ogre::Vector3 loc = target->getPosition();
-        attacker->addOrder(
-            NULL,
-            FOCUSED_MELEE_ATTACK,
-            target,
-            false,                  // shift
-            clearExistingOrders,
-            loc);
+        if (playerControlled)
+        {
+            // Player characters need an actual player order; attackTarget alone
+            // is not enough to keep them moving toward the opponent.
+            attacker->addOrder(
+                NULL,
+                FOCUSED_MELEE_ATTACK,
+                target,
+                false,              // shift
+                clearExistingOrders,
+                loc);
+        }
+        else
+        {
+            // Released prisoners remain NPC-controlled. addOrder takes the
+            // player-command path, while addJob feeds the persistent jobs list.
+            // Neither reliably replaces an NPC's active package goal (for
+            // example Patrolling). Replace the active goal stack directly.
+            attacker->clearAllAIGoals();
+            attacker->addGoal(
+                UNPROVOKED_FOCUSED_MELEE_ATTACK,
+                static_cast<RootObjectBase*>(target));
+        }
 
         // Also poke combat targeting + awareness both ways.
         attacker->attackTarget(target);
         target->attackingYou(attacker, true, false);
+        if (!playerControlled)
+        {
+            // Arena staging deliberately parks released prisoners and asks
+            // their NPC AI to rethink. Force another evaluation now that its
+            // old package goal is gone and the native attack goal exists.
+            attacker->reThinkCurrentAIAction();
+        }
+        if (clearExistingOrders)
+            SetAssignedTarget(attacker, target);
+    }
+
+    void ClearPlayerAttackOrders(Character* c)
+    {
+        if (!c || (!IsPlayerCharacter(c) && !TownArena::IsFighter(c)))
+            return;
+
+        // Player spars and town staging use addOrder. removeJob alone can
+        // leave the order queue armed so they stay in a fighting pose after
+        // temp-enemy (and therefore damage) is already gone.
+        const Ogre::Vector3 loc = c->getPosition();
+        c->addOrder(NULL, MOVE_CUS_ORDERED, NULL, false, true, loc);
+        c->removeJob(MOVE_CUS_ORDERED);
     }
 
     void DisengageFighter(Character* c)
     {
         const int stateIndex = FindOriginalState(c);
+        const FightDisengagePolicy::Plan plan =
+            FightDisengagePolicy::BuildFullDisengagePlan();
+
         if (c && c->isValid())
         {
-            c->clearAllTempEnemyStatuses(ST_TEMPORARY_ENEMY);
-            c->endCombatMode();
+            if (plan.clearTempEnemies)
+                c->clearAllTempEnemyStatuses(ST_TEMPORARY_ENEMY);
 
             if (!c->isDead())
             {
-                c->removeJob(FOCUSED_MELEE_ATTACK);
-                if (stateIndex >= 0)
+                if (plan.removeFocusedMeleeJobs)
                 {
-                    const FighterOrderState state =
-                        g_originalStates[static_cast<size_t>(stateIndex)];
-                    c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, state.passive);
-                    c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, state.hold);
-                    c->setStandingOrder(MessageForB::M_SET_ORDER_DEF, state.defensive);
-                    c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, state.aggressive);
-                    CharMovement* movement = c->getMovement();
-                    if (movement)
-                    {
-                        movement->setDesiredSpeedOrders(state.moveSpeed);
-                        movement->restoreDesiredSpeed();
-                    }
+                    c->removeJob(FOCUSED_MELEE_ATTACK);
+                    c->removeJob(UNPROVOKED_FOCUSED_MELEE_ATTACK);
                 }
-                else
+
+                if (plan.clearPlayerAttackOrders)
+                    ClearPlayerAttackOrders(c);
+
+                if (plan.endCombatMode)
+                    c->endCombatMode();
+
+                if (plan.clearAiGoals)
+                    c->clearAllAIGoals();
+
+                if (plan.rethinkAi)
+                    c->reThinkCurrentAIAction();
+
+                if (plan.restoreStandingOrders)
                 {
-                    c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, false);
+                    if (stateIndex >= 0)
+                    {
+                        const FighterOrderState state =
+                            g_originalStates[static_cast<size_t>(stateIndex)];
+                        c->setStandingOrder(MessageForB::M_SET_ORDER_PASSIVE, state.passive);
+                        c->setStandingOrder(MessageForB::M_SET_ORDER_HOLD, state.hold);
+                        c->setStandingOrder(MessageForB::M_SET_ORDER_DEF, state.defensive);
+                        c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, state.aggressive);
+                        CharMovement* movement = c->getMovement();
+                        if (movement)
+                        {
+                            movement->setDesiredSpeedOrders(state.moveSpeed);
+                            movement->restoreDesiredSpeed();
+                        }
+                    }
+                    else
+                    {
+                        c->setStandingOrder(MessageForB::M_SET_ORDER_AGG, false);
+                    }
                 }
 
                 if (stateIndex >= 0 &&
@@ -304,17 +414,53 @@ namespace
                     SetJobsEnabled(c, true);
                 }
             }
+            else if (plan.endCombatMode)
+            {
+                c->endCombatMode();
+            }
         }
         if (stateIndex >= 0)
         {
             g_originalStates.erase(
                 g_originalStates.begin() + static_cast<size_t>(stateIndex));
         }
+        ClearAssignedTarget(c);
+    }
+
+    void ClearFighterForRetarget(Character* c)
+    {
+        const FightDisengagePolicy::Plan plan =
+            FightDisengagePolicy::BuildInMatchRetargetPlan();
+
+        if (!c || !c->isValid())
+            return;
+
+        if (plan.clearTempEnemies)
+            c->clearAllTempEnemyStatuses(ST_TEMPORARY_ENEMY);
+
+        if (c->isDead())
+            return;
+
+        if (plan.removeFocusedMeleeJobs)
+        {
+            c->removeJob(FOCUSED_MELEE_ATTACK);
+            c->removeJob(UNPROVOKED_FOCUSED_MELEE_ATTACK);
+        }
+
+        if (plan.clearPlayerAttackOrders)
+            ClearPlayerAttackOrders(c);
+        ClearAssignedTarget(c);
     }
 }
 
 namespace FightStarter
 {
+    void AbandonWorldState()
+    {
+        g_originalStates.clear();
+        g_focusAssignments.clear();
+    }
+
     void RememberMatchFighters(Character** fighters, int count)
     {
         if (!fighters || count <= 0)
@@ -328,7 +474,7 @@ namespace FightStarter
         if (!fighters || !teams || count < 2)
             return;
 
-        DebugLog("Proving Grounds: FightStarter EngageMatch (temp-enemy + focused melee orders)");
+        PGLog::Debug("Proving Grounds: FightStarter EngageMatch (temp-enemy + focused melee orders)");
 
         for (int i = 0; i < count; ++i)
         {
@@ -395,10 +541,51 @@ namespace FightStarter
         if (!fighters || count <= 0)
             return;
 
-        DebugLog("Proving Grounds: FightStarter DisengageMatch");
+        PGLog::Debug("Proving Grounds: FightStarter DisengageMatch");
 
         for (int i = 0; i < count; ++i)
             DisengageFighter(fighters[i]);
+    }
+
+    void RetargetMatchAfterElimination(
+        Character** allFighters,
+        int allCount,
+        Character** remainingFighters,
+        MatchRules::MatchTeam* remainingTeams,
+        int remainingCount,
+        MatchRules::MatchMode mode)
+    {
+        if (!allFighters || allCount <= 0)
+            return;
+
+        PGLog::Debug("Proving Grounds: FightStarter retarget after elimination");
+
+        // Deliberately preserve g_originalStates and Jobs. Full disengage uses
+        // the global toggle_jobs UI command, which clicks audibly and briefly
+        // interrupts the selected squad before EngageMatch toggles it back.
+        for (int i = 0; i < allCount; ++i)
+            ClearFighterForRetarget(allFighters[i]);
+
+        if (remainingFighters && remainingTeams && remainingCount >= 2)
+            EngageMatch(remainingFighters, remainingTeams, remainingCount, mode);
+    }
+
+    void ReactToIncomingAttack(Character* defender, Character* attacker)
+    {
+        if (!IsLivingFighter(defender) || !IsLivingFighter(attacker) ||
+            !SparSession::IsActive() ||
+            SparSession::GetMode() == MatchRules::ModeTeams1v1 ||
+            SparSession::IsEliminated(defender) ||
+            SparSession::IsEliminated(attacker) ||
+            !SparSession::IsSparringOpponent(defender, attacker) ||
+            FindAssignedTarget(defender) == attacker)
+        {
+            return;
+        }
+
+        MarkTempEnemy(defender, attacker);
+        IssueAttackOrder(defender, attacker, true);
+        PGLog::Debug("Proving Grounds: fighter retargeted to incoming attacker");
     }
 
     void KeepEngagedMatch(Character** fighters, MatchRules::MatchTeam* teams, int count, MatchRules::MatchMode mode)
@@ -426,7 +613,11 @@ namespace FightStarter
                 }
             }
 
-            if (validTarget)
+            // A non-player fighter can retain an attack target even after its
+            // AI combat task stalls. Treat that as healthy only while it is
+            // actually in melee combat, so the keep-alive can repair the job.
+            if (validTarget &&
+                (IsPlayerCharacter(fighter) || fighter->isInCombatMode(true, false)))
                 continue;
 
             if (mode == MatchRules::ModeLastStanding)
@@ -478,7 +669,7 @@ namespace FightStarter
         // Diagnostic: isEnemy should be true via memory and/or our hook.
         const bool aSeesB = a->isEnemy(b, false);
         const bool bSeesA = b->isEnemy(a, false);
-        DebugLog(aSeesB && bSeesA
+        PGLog::Debug(aSeesB && bSeesA
             ? "Proving Grounds: isEnemy OK both ways"
             : "Proving Grounds: WARN isEnemy still false after setup");
     }

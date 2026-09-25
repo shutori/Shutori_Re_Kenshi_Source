@@ -5,7 +5,7 @@
 
 namespace MmrRating
 {
-    static const float kDefaultMmr = 0.0f;
+    static const float kDefaultMmr = 100.0f;
     static const float kFloorMmr = 0.0f;
     static const float kMaxAbsDelta = 50.0f;
     static const float kPerfMultMin = 0.75f;
@@ -31,6 +31,11 @@ namespace MmrRating
     // Writes mmrAfter[i] for each fighter. Fighters with rateMask[i]==false are
     // left unchanged (mmrAfter = mmrBefore). Stopped/Draw → no changes.
     // winsOut/lossesOut: +1 when that fighter is rated and wins/loses.
+    //
+    // When BalanceTuning::Get().zeroSumRating is set, deltas are weighted by the
+    // rated team sizes and then rescaled so the bout's total rating change is
+    // zero. Without it each fighter moves by an independent delta, so any bout
+    // with uneven teams leaks rating out of (or into) the pool.
     void ApplyMatch(
         const SparPodium::Snapshot& snap,
         const float* mmrBefore,

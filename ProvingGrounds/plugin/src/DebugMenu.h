@@ -6,4 +6,6 @@ namespace DebugMenu
     void Toggle();
     void Close();
     bool IsVisible();
+    void Tick();
+    void AbandonWorldState();
 }

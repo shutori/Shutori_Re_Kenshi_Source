@@ -1,18 +1,35 @@
 #include "ArenaUI.h"
+#include "ArenaRingGuard.h"
+#include "WorldLifecycle.h"
+#include "NativeUI.h"
+#include "MarksHUD.h"
+
+#include "LeaderboardLayout.h"
+#include "TownArena.h"
+#include "TownArenaUI.h"
+#include "TownBookie.h"
+#include "ArenaIdentity.h"
 #include "ArenaIngress.h"
+#include "ArenaMedical.h"
 #include "ContextMenuHooks.h"
 #include "DebugMenu.h"
+#include "PGConfig.h"
+#include "PGSettingsUI.h"
+#include "FrameCadencePolicy.h"
 #include "KOWatcher.h"
 #include "LeaderboardUI.h"
 #include "LeaderboardStore.h"
 #include "MatchRules.h"
 #include "PrisonerMatchLogic.h"
+#include "PrisonerRecruitmentUI.h"
 #include "PrisonerUtil.h"
 #include "ResultsUI.h"
+#include "RewardsUI.h"
+#include "RosterStatus.h"
 #include "SparSession.h"
 #include "SquadUtil.h"
 
-#include <Debug.h>
+#include "PGLog.h"
 #include <core/Functions.h>
 
 #pragma warning(push)
@@ -23,6 +40,7 @@
 #include <kenshi/Globals.h>
 #include <kenshi/InputHandler.h>
 #include <kenshi/gui/ForgottenGUI.h>
+#include <kenshi/gui/OptionsWindow.h>
 #include <kenshi/gui/PortraitManager.h>
 #include <kenshi/gui/TitleScreen.h>
 #include <kenshi/util/hand.h>
@@ -38,9 +56,9 @@
 #include <mygui/MyGUI_RenderManager.h>
 #include <mygui/MyGUI_ScrollView.h>
 #include <mygui/MyGUI_TextBox.h>
+#include <mygui/MyGUI_WidgetToolTip.h>
 #include <mygui/MyGUI_Window.h>
 
-#include <ogre/OgreResourceGroupManager.h>
 #include <ogre/OgreVector3.h>
 
 #include <Windows.h>
@@ -49,6 +67,7 @@
 #include <cstdio>
 #include <cctype>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #ifndef NULL
@@ -60,15 +79,17 @@ namespace
     enum UiMode { UiAvB, UiTeams1v1, UiLastStanding };
     enum AssignDest { DestTeamA, DestTeamB };
     enum ListKind { ListRoster, ListTeamA, ListTeamB, ListPool };
-    enum RosterFilter { FilterAll, FilterReady, FilterAssigned, FilterUnavailable };
+    enum RosterFilter { FilterAll };
 
     struct PortraitRow
     {
         MyGUI::Widget* root;
         MyGUI::ImageBox* image;
-        MyGUI::Button* handlerFrame;
+        MyGUI::Widget* handlerFrame;
         MyGUI::ImageBox* handlerImage;
         MyGUI::TextBox* label;
+        MyGUI::Widget* statusBack;
+        MyGUI::Widget* statusFill;
         MyGUI::TextBox* handlerLabel;
         Character* character;
         ListKind kind;
@@ -86,7 +107,7 @@ namespace
         UiMode mode;
         AssignDest destination;
         ArenaIngress::LocationMode location;
-        bool koElimination;
+        ArenaMedical::Protocol medicalProtocol;
         std::vector<Character*> teamA;
         std::vector<Character*> teamB;
         std::vector<Character*> pool;
@@ -109,37 +130,27 @@ namespace
 
     TitleScreen* (*TitleScreen_orig)(TitleScreen*) = NULL;
     void (*ForgottenGUI_update_orig)(ForgottenGUI*) = NULL;
+    void (*OptionsWindow_update_orig)(OptionsWindow*) = NULL;
 
     MyGUI::Window* g_window = NULL;
-    MyGUI::TextBox* g_titleEyebrow = NULL;
     MyGUI::TextBox* g_titleHero = NULL;
 
     MyGUI::ScrollView* g_rosterScroll = NULL;
     MyGUI::ScrollView* g_teamAScroll = NULL;
     MyGUI::ScrollView* g_teamBScroll = NULL;
     MyGUI::ScrollView* g_poolScroll = NULL;
-    MyGUI::Button* g_rosterScrollUp = NULL;
-    MyGUI::Button* g_rosterScrollDown = NULL;
-    MyGUI::Button* g_teamAScrollUp = NULL;
-    MyGUI::Button* g_teamAScrollDown = NULL;
-    MyGUI::Button* g_teamBScrollUp = NULL;
-    MyGUI::Button* g_teamBScrollDown = NULL;
-    MyGUI::Button* g_poolScrollUp = NULL;
-    MyGUI::Button* g_poolScrollDown = NULL;
     MyGUI::EditBox* g_rosterSearch = NULL;
-    MyGUI::Button* g_rosterSearchSurface = NULL;
     MyGUI::TextBox* g_rosterCount = NULL;
-    MyGUI::Button* g_filterAll = NULL;
-    MyGUI::Button* g_filterReady = NULL;
-    MyGUI::Button* g_filterAssigned = NULL;
-    MyGUI::Button* g_filterUnavailable = NULL;
 
     MyGUI::Button* g_modeAvB = NULL;
     MyGUI::Button* g_modeTeams1v1 = NULL;
     MyGUI::Button* g_modeLast = NULL;
     MyGUI::Button* g_locArena = NULL;
+    MyGUI::Button* g_locSmallArena = NULL;
     MyGUI::Button* g_locBanner = NULL;
-    MyGUI::Button* g_koEliminationButton = NULL;
+    MyGUI::Button* g_medicalProtocolButton = NULL;
+    MyGUI::EditBox* g_settingsTip = NULL;
+    MyGUI::Widget* g_settingsTipOwner = NULL;
     MyGUI::TextBox* g_lblTeamA = NULL;
     MyGUI::TextBox* g_lblTeamB = NULL;
     MyGUI::TextBox* g_lblPool = NULL;
@@ -151,11 +162,9 @@ namespace
     MyGUI::Button* g_btnBalanceSkill = NULL;
     MyGUI::Button* g_btnBalanceRating = NULL;
     MyGUI::Button* g_btnClearTeams = NULL;
+    MyGUI::Button* g_btnRecruitment = NULL;
     MyGUI::Button* g_btnSwapTeams = NULL;
     MyGUI::Button* g_presetButtons[3] = { NULL, NULL, NULL };
-    MyGUI::Button* g_teamASurface = NULL;
-    MyGUI::Button* g_teamBSurface = NULL;
-    MyGUI::Button* g_poolSurface = NULL;
 
     MyGUI::ImageBox* g_previewImage = NULL;
     MyGUI::TextBox* g_previewName = NULL;
@@ -167,8 +176,6 @@ namespace
     MyGUI::TextBox* g_status = NULL;
     MyGUI::Button* g_rosterDrawerButton = NULL;
     MyGUI::Button* g_settingsDrawerButton = NULL;
-    std::vector<MyGUI::Widget*> g_rosterColumnWidgets;
-    std::vector<MyGUI::Widget*> g_settingsColumnWidgets;
 
     std::vector<Character*> g_squadCache;
     std::vector<Character*> g_rosterCache;
@@ -182,10 +189,9 @@ namespace
     std::vector<PortraitRow> g_poolRows;
     std::vector<HandlerAssignment> g_handlerAssignments;
     SetupPreset g_setupPresets[3] = {};
-    int g_listScrollOffset[4] = { 0, 0, 0, 0 };
 
     UiMode g_uiMode = UiAvB;
-    bool g_koEliminationEnabled = false;
+    ArenaMedical::Protocol g_medicalProtocol = ArenaMedical::RingsideAid;
     bool g_balanceMenuOpen = false;
 
     bool IsTeamUiMode()
@@ -204,195 +210,74 @@ namespace
     bool g_compactMode = false;
     bool g_rosterDrawerOpen = false;
     bool g_settingsDrawerOpen = false;
+    const float kIdleUiRefreshIntervalSec = 0.20f;
+    DWORD g_uiRefreshLastTick = 0;
+    float g_uiRefreshElapsedSec = kIdleUiRefreshIntervalSec;
 
-    // F8 debug routing. Keep only one enabled; debug menu wins if both are true.
-    static const bool kF8OpensDebugMenu = true;
-    static const bool kF8OpensArenaUi = false;
+    float AdvanceUiRefreshClock()
+    {
+        const DWORD now = GetTickCount();
+        const float dt = g_uiRefreshLastTick == 0 ? 0.0f :
+            static_cast<float>(now - g_uiRefreshLastTick) / 1000.0f;
+        g_uiRefreshLastTick = now;
+        return dt > 1.0f ? 1.0f : dt;
+    }
 
-    // Kenshi MyGUI loads textures from resource group "GUI".
-    // Paths under mods/<mod>/gui/... are auto-added to GUI (same as Character Inspector).
-    static const char* kArenaBgTexture = "arena_ui.png";
-    static const char* kArenaTopTexture = "arena_top.png";
-    static const char* kArenaUiResourceGroup = "GUI";
-    bool g_arenaUiResourcesReady = false;
-    MyGUI::ImageBox* g_arenaBg = NULL;
-    MyGUI::ImageBox* g_arenaTop = NULL;
+    void ResetUiRefreshClock()
+    {
+        g_uiRefreshLastTick = 0;
+        g_uiRefreshElapsedSec = kIdleUiRefreshIntervalSec;
+    }
 
     const int kRowH = 56;
     const int kPortraitSize = 48;
     const int kHandlerPortraitSize = 22;
-    const int kHandlerBadgeSize = 26;
+    const int kStatusBarHeight = 6;
     const float kMaxFighterDistanceFromRegistry = 2500.0f;
-
-    const MyGUI::Colour kBgDark(26.f / 255.f, 22.f / 255.f, 18.f / 255.f, 1.f);
-    const MyGUI::Colour kTextPrimary(232.f / 255.f, 220.f / 255.f, 200.f / 255.f, 1.f);
-    const MyGUI::Colour kBrass(196.f / 255.f, 165.f / 255.f, 116.f / 255.f, 1.f);
-    const MyGUI::Colour kCta(107.f / 255.f, 58.f / 255.f, 30.f / 255.f, 1.f);
-    const MyGUI::Colour kTeamA(122.f / 255.f, 59.f / 255.f, 46.f / 255.f, 1.f);
-    const MyGUI::Colour kTeamB(59.f / 255.f, 90.f / 255.f, 122.f / 255.f, 1.f);
-    const MyGUI::Colour kMuted(154.f / 255.f, 139.f / 255.f, 114.f / 255.f, 1.f);
-    const MyGUI::Colour kAmber(222.f / 255.f, 169.f / 255.f, 76.f / 255.f, 1.f);
-    const MyGUI::Colour kDanger(184.f / 255.f, 72.f / 255.f, 58.f / 255.f, 1.f);
-    const MyGUI::Colour kReady(112.f / 255.f, 156.f / 255.f, 101.f / 255.f, 1.f);
-    const MyGUI::Colour kDisabled(104.f / 255.f, 98.f / 255.f, 88.f / 255.f, 1.f);
-
-    std::string GetPluginModDirectory()
+    MyGUI::ScrollView* g_columns[3] = { NULL, NULL, NULL };
+    MyGUI::Widget* g_columnContent[3] = { NULL, NULL, NULL };
+    MyGUI::TextBox* g_metrics = NULL;
+    MyGUI::IntSize g_viewSize;
+    bool g_layoutReady = false;
+    struct ButtonPresentation
     {
-        HMODULE module = NULL;
-        if (!GetModuleHandleExA(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                (LPCSTR)&GetPluginModDirectory,
-                &module) ||
-            !module)
-        {
-            return std::string();
-        }
+        MyGUI::Button* button;
+        MyGUI::EditBox* text;
+        std::string caption;
+        int naturalWidth;
+    };
+    std::vector<ButtonPresentation> g_buttonPresentation;
+    void LayoutPanel();
 
-        char path[MAX_PATH];
-        DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
-        if (len == 0 || len >= MAX_PATH)
-            return std::string();
-
-        std::string full(path, path + len);
-        size_t slash = full.find_last_of("\\/");
-        if (slash == std::string::npos)
-            return std::string();
-        return full.substr(0, slash);
+    void Passive(MyGUI::Widget* widget)
+    {
+        if (!widget) return;
+        widget->setNeedMouseFocus(false);
+        widget->setNeedKeyFocus(false);
+        for (size_t i = 0; i < widget->getChildCount(); ++i)
+            Passive(widget->getChildAt(i));
+        MyGUI::Widget* client = widget->getClientWidget();
+        if (client && client != widget) Passive(client);
     }
 
-    bool EnsureArenaUiResources()
+    MyGUI::Colour StatusColour(RosterStatusPolicy::Band band)
     {
-        if (g_arenaUiResourcesReady)
-            return true;
-
-        std::string modDir = GetPluginModDirectory();
-        if (modDir.empty())
-        {
-            ErrorLog("Proving Grounds: could not resolve mod directory for UI images");
-            return false;
-        }
-
-        // Match Character Inspector: assets live under gui/ so Kenshi maps them into GUI.
-        std::string imagesDir = modDir + "\\gui\\images";
-        try
-        {
-            Ogre::ResourceGroupManager& rgm = Ogre::ResourceGroupManager::getSingleton();
-            const bool hasBg = rgm.resourceExists(kArenaUiResourceGroup, kArenaBgTexture);
-            const bool hasTop = rgm.resourceExists(kArenaUiResourceGroup, kArenaTopTexture);
-            if (!hasBg || !hasTop)
-            {
-                rgm.addResourceLocation(imagesDir, "FileSystem", kArenaUiResourceGroup, false);
-                DebugLog(("Proving Grounds: registered GUI images at " + imagesDir).c_str());
-            }
-            else
-            {
-                DebugLog("Proving Grounds: Arena UI textures already in GUI resource group");
-            }
-            g_arenaUiResourcesReady = true;
-            return true;
-        }
-        catch (...)
-        {
-            ErrorLog("Proving Grounds: failed to register Arena UI image resources");
-            return false;
-        }
+        if (band == RosterStatusPolicy::Green) return MyGUI::Colour(.18f, .72f, .28f);
+        if (band == RosterStatusPolicy::Orange) return MyGUI::Colour(.95f, .52f, .12f);
+        return MyGUI::Colour(.78f, .16f, .12f);
     }
 
-    void TintWidget(MyGUI::Widget* w, const MyGUI::Colour& c);
-
-    void ApplyGuiTexture(MyGUI::ImageBox* image, const char* textureName)
+    void RefreshStatusBar(MyGUI::Widget* back, MyGUI::Widget* fill, Character* character)
     {
-        if (!image || !textureName)
-            return;
-        if (!EnsureArenaUiResources())
-        {
-            ErrorLog("Proving Grounds: UI texture skipped (resources unavailable)");
-            return;
-        }
-        image->setImageTexture(textureName);
-        image->setVisible(true);
-        image->setNeedMouseFocus(false);
-    }
-
-    void ApplyArenaChrome()
-    {
-        ApplyGuiTexture(g_arenaBg, kArenaBgTexture);
-        ApplyGuiTexture(g_arenaTop, kArenaTopTexture);
-    }
-
-    void InstallArenaTopBar(MyGUI::Window* window)
-    {
-        if (!window || g_arenaTop)
-            return;
-
-        // Kenshi_WindowCX header: use Window API — findWidget("Caption") is unreliable.
-        MyGUI::TextBox* caption = window->getCaptionWidget();
-        MyGUI::Widget* header = caption ? caption->getParent() : NULL;
-        if (!header)
-        {
-            // Fallback: paint top bar on the window itself (above client).
-            header = window;
-            DebugLog("Proving Grounds: no caption parent — top bar on window root");
-        }
-
-        MyGUI::Widget* closeBtn = NULL;
-        MyGUI::Widget* searchRoot = caption ? caption->getParent() : window;
-        if (searchRoot)
-        {
-            for (size_t i = 0; i < searchRoot->getChildCount(); ++i)
-            {
-                MyGUI::Widget* child = searchRoot->getChildAt(i);
-                if (child && child->getUserString("Event") == "close")
-                {
-                    closeBtn = child;
-                    break;
-                }
-            }
-        }
-
-        const int barH = (header == static_cast<MyGUI::Widget*>(window))
-            ? 38
-            : header->getHeight();
-        const int barW = header->getWidth() > 0 ? header->getWidth() : window->getWidth();
-
-        g_arenaTop = header->createWidget<MyGUI::ImageBox>(
-            "ImageBox",
-            0,
-            0,
-            barW,
-            barH > 0 ? barH : 38,
-            MyGUI::Align::HStretch | MyGUI::Align::Top,
-            "PG_ArenaTop");
-        ApplyGuiTexture(g_arenaTop, kArenaTopTexture);
-
-        // Re-attach caption + close so they draw above the ImageBox.
-        if (caption && caption->getParent() == header)
-        {
-            const MyGUI::IntCoord coord = caption->getCoord();
-            const MyGUI::Align align = caption->getAlign();
-            caption->detachFromWidget();
-            caption->attachToWidget(header);
-            caption->setCoord(coord);
-            caption->setAlign(align);
-            TintWidget(caption, kBrass);
-        }
-        if (closeBtn && closeBtn->getParent() == header)
-        {
-            const MyGUI::IntCoord coord = closeBtn->getCoord();
-            const MyGUI::Align align = closeBtn->getAlign();
-            closeBtn->detachFromWidget();
-            closeBtn->attachToWidget(header);
-            closeBtn->setCoord(coord);
-            closeBtn->setAlign(align);
-        }
-
-        DebugLog("Proving Grounds: Arena top bar installed");
-    }
-
-    void TintWidget(MyGUI::Widget* w, const MyGUI::Colour& c)
-    {
-        if (w)
-            w->setColour(c);
+        if (!back || !fill) return;
+        RosterStatus::Snapshot status = {};
+        const bool visible = RosterStatus::Read(character, status);
+        back->setVisible(visible);
+        if (!visible) return;
+        const int width = static_cast<int>(back->getWidth() * status.recovery + .5f);
+        fill->setVisible(width > 0);
+        fill->setCoord(0, 0, width, back->getHeight());
+        fill->setColour(StatusColour(status.band));
     }
 
     bool IsTooFarFromRegistry(Character* c)
@@ -727,8 +612,6 @@ namespace
 
     void OnPortraitRowClick(MyGUI::Widget* sender);
     void OnPortraitRowDoubleClick(MyGUI::Widget* sender);
-    void OnPortraitRowHover(MyGUI::Widget* sender, MyGUI::Widget* oldFocus);
-    void OnPortraitRowLeave(MyGUI::Widget* sender, MyGUI::Widget* newFocus);
     void OnPortraitRowWheel(MyGUI::Widget* sender, int rel);
     void OnPortraitRowDrag(
         MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton button);
@@ -748,248 +631,127 @@ namespace
 
     PortraitRow MakeRow(MyGUI::ScrollView* scroll, Character* c, ListKind kind, int index, int width)
     {
-        PortraitRow row;
-        row.root = NULL;
-        row.image = NULL;
-        row.handlerFrame = NULL;
-        row.handlerImage = NULL;
-        row.label = NULL;
-        row.handlerLabel = NULL;
+        PortraitRow row = {};
         row.character = c;
         row.kind = kind;
-
-        if (!scroll || !c)
-            return row;
-
-        char nameBuf[64];
-        sprintf_s(nameBuf, "PG_Row_%d_%d", static_cast<int>(kind), index);
-
-        row.root = scroll->createWidget<MyGUI::Button>(
-            "Kenshi_Button1",
-            0,
-            index * kRowH - g_listScrollOffset[static_cast<int>(kind)],
-            width,
-            kRowH - 4,
-            MyGUI::Align::Default,
-            nameBuf);
-        if (!row.root)
-            return row;
-
-        row.root->setNeedMouseFocus(true);
+        if (!scroll || !c) return row;
+        char name[64], tag[32];
+        sprintf_s(name, "PG_Row_%d_%d", static_cast<int>(kind), index);
+        row.root = NativeUI::Button(scroll, MyGUI::IntCoord(0, 0, width, kRowH), name, "");
         row.root->eventMouseButtonClick += MyGUI::newDelegate(OnPortraitRowClick);
         row.root->eventMouseButtonDoubleClick += MyGUI::newDelegate(OnPortraitRowDoubleClick);
-        row.root->eventMouseSetFocus += MyGUI::newDelegate(OnPortraitRowHover);
-        row.root->eventMouseLostFocus += MyGUI::newDelegate(OnPortraitRowLeave);
         row.root->eventMouseWheel += MyGUI::newDelegate(OnPortraitRowWheel);
         row.root->eventMouseDrag += MyGUI::newDelegate(OnPortraitRowDrag);
         row.root->eventMouseButtonReleased += MyGUI::newDelegate(OnPortraitRowRelease);
-
-        sprintf_s(nameBuf, "PG_Img_%d_%d", static_cast<int>(kind), index);
-        row.image = row.root->createWidget<MyGUI::ImageBox>(
-            "ImageBox", 5, 3, kPortraitSize, kPortraitSize, MyGUI::Align::Default, nameBuf);
-        if (row.image)
+        sprintf_s(tag, "%d:%d", static_cast<int>(kind), index);
+        row.root->setUserString("pg", tag);
+        row.image = row.root->createWidget<MyGUI::ImageBox>("ImageBox",
+            MyGUI::IntCoord(4, 4, kPortraitSize, kPortraitSize), MyGUI::Align::Default);
+        Passive(row.image);
+        BindPortrait(row.image, c);
+        row.label = row.root->createWidget<MyGUI::EditBox>("Kenshi_PaintedWordWrapEmpty",
+            MyGUI::IntCoord(60, 4, (std::max)(1, width - 68), 40), MyGUI::Align::Default);
+        std::string caption = c->getName();
+        if (kind == ListRoster && (IsAssigned(c) || !IsAssignable(c)))
+            caption += "\n" + FighterDetailLabel(c);
+        else if (kind != ListRoster && !FighterUnavailableReason(c).empty())
+            caption += "\nUnavailable - " + FighterUnavailableReason(c);
+        row.label->setCaption(caption);
+        Passive(row.label);
+        if (kind == ListRoster)
         {
-            // Keep focus on the row while crossing its portrait and text.
-            // Child focus transitions were causing the hover tint to flicker.
-            row.image->setNeedMouseFocus(false);
-            BindPortrait(row.image, c);
+            row.statusBack = row.root->createWidget<MyGUI::Widget>("WhiteSkin",
+                MyGUI::IntCoord(60, 46, (std::max)(1, width - 68), kStatusBarHeight), MyGUI::Align::Default);
+            row.statusBack->setColour(MyGUI::Colour(.12f, .12f, .12f));
+            row.statusFill = row.statusBack->createWidget<MyGUI::Widget>("WhiteSkin",
+                MyGUI::IntCoord(0, 0, 1, kStatusBarHeight), MyGUI::Align::Default);
+            Passive(row.statusBack);
+            RefreshStatusBar(row.statusBack, row.statusFill, c);
         }
-
-        Character* assignedHandler = NULL;
-        if (kind != ListRoster &&
-            PrisonerUtil::IsRosterPrisoner(c) &&
-            !c->isUnconcious())
+        Character* handler = kind != ListRoster && PrisonerUtil::IsRosterPrisoner(c) &&
+            !c->isUnconcious() ? FindHandlerAssignment(c) : NULL;
+        if (handler)
         {
-            assignedHandler = FindHandlerAssignment(c);
-            if (assignedHandler)
-            {
-                // Keep the handler visually separate on the right edge so the
-                // prisoner's portrait remains the clear primary identity.
-                sprintf_s(nameBuf, "PG_HFrame_%d_%d", static_cast<int>(kind), index);
-                row.handlerFrame = row.root->createWidget<MyGUI::Button>(
-                    "Kenshi_Button1",
-                    width - kHandlerBadgeSize - 6,
-                    (kRowH - 4 - kHandlerBadgeSize) / 2,
-                    kHandlerBadgeSize,
-                    kHandlerBadgeSize,
-                    MyGUI::Align::Default,
-                    nameBuf);
-                if (row.handlerFrame)
-                {
-                    row.handlerFrame->setNeedMouseFocus(false);
-                    TintWidget(row.handlerFrame, kAmber);
-                }
-
-                sprintf_s(nameBuf, "PG_HImg_%d_%d", static_cast<int>(kind), index);
-                MyGUI::Widget* handlerParent = row.handlerFrame ?
-                    static_cast<MyGUI::Widget*>(row.handlerFrame) : row.root;
-                row.handlerImage = handlerParent->createWidget<MyGUI::ImageBox>(
-                    "ImageBox",
-                    row.handlerFrame ? 2 : (width - kHandlerPortraitSize - 8),
-                    row.handlerFrame ? 2 : ((kRowH - 4 - kHandlerPortraitSize) / 2),
-                    kHandlerPortraitSize,
-                    kHandlerPortraitSize,
-                    MyGUI::Align::Default,
-                    nameBuf);
-                if (row.handlerImage)
-                {
-                    row.handlerImage->setNeedMouseFocus(false);
-                    BindPortrait(row.handlerImage, assignedHandler);
-                }
-            }
+            row.handlerImage = row.root->createWidget<MyGUI::ImageBox>("ImageBox",
+                MyGUI::IntCoord(4, 4, kHandlerPortraitSize, kHandlerPortraitSize), MyGUI::Align::Default);
+            Passive(row.handlerImage);
+            BindPortrait(row.handlerImage, handler);
+            row.handlerLabel = row.root->createWidget<MyGUI::EditBox>("Kenshi_PaintedWordWrapEmpty",
+                MyGUI::IntCoord(32, 4, (std::max)(1, width - 40), 24), MyGUI::Align::Default);
+            row.handlerLabel->setCaption("Handler: " + handler->getName());
+            Passive(row.handlerLabel);
         }
-
-        const int labelX = 12 + kPortraitSize;
-        const int labelRightPadding = assignedHandler ? kHandlerBadgeSize + 12 : 6;
-        sprintf_s(nameBuf, "PG_Lbl_%d_%d", static_cast<int>(kind), index);
-        row.label = row.root->createWidget<MyGUI::TextBox>(
-            "Kenshi_TextboxStandardText",
-            labelX,
-            5,
-            width - (labelX + labelRightPadding),
-            assignedHandler ? 22 : 40,
-            MyGUI::Align::Default,
-            nameBuf);
-        if (row.label)
-        {
-            row.label->setNeedMouseFocus(false);
-            row.label->setTextAlign(MyGUI::Align::VCenter | MyGUI::Align::Left);
-            TintWidget(row.label, IsAssignable(c) ? kTextPrimary : kMuted);
-            if (kind == ListRoster)
-            {
-                std::string caption = c->getName();
-                if (IsAssigned(c) || !IsAssignable(c))
-                {
-                    caption += "\n";
-                    caption += FighterDetailLabel(c);
-                }
-                row.label->setCaption(caption);
-            }
-            else
-            {
-                std::string caption = c->getName();
-                const std::string reason = FighterUnavailableReason(c);
-                if (!reason.empty())
-                {
-                    caption += "\nUnavailable - ";
-                    caption += reason;
-                }
-                row.label->setCaption(caption);
-            }
-        }
-
-        if (assignedHandler)
-        {
-            sprintf_s(nameBuf, "PG_HLbl_%d_%d", static_cast<int>(kind), index);
-            row.handlerLabel = row.root->createWidget<MyGUI::TextBox>(
-                "Kenshi_TextboxStandardText",
-                labelX,
-                26,
-                width - (labelX + labelRightPadding),
-                20,
-                MyGUI::Align::Default,
-                nameBuf);
-            if (row.handlerLabel)
-            {
-                std::string caption("Handler: ");
-                caption += assignedHandler->getName();
-                row.handlerLabel->setCaption(caption);
-                row.handlerLabel->setFontHeight(12);
-                row.handlerLabel->setTextAlign(MyGUI::Align::VCenter | MyGUI::Align::Left);
-                row.handlerLabel->setNeedMouseFocus(false);
-                TintWidget(row.handlerLabel, kAmber);
-            }
-
-        }
-        // Encode kind+index for click lookup (VS2010-safe).
-        char userBuf[32];
-        sprintf_s(userBuf, "%d:%d", static_cast<int>(kind), index);
-        row.root->setUserString("pg", userBuf);
-        if (row.image)
-            row.image->setUserString("pg", userBuf);
-        if (row.label)
-            row.label->setUserString("pg", userBuf);
-
-        TintWidget(row.root, c == g_previewChar ? kAmber :
-            (IsAssignable(c) ? kMuted : kDisabled));
-
+        static_cast<MyGUI::Button*>(row.root)->setStateSelected(c == g_previewChar);
         return row;
     }
 
-    void RebuildList(
-        MyGUI::ScrollView* scroll,
-        std::vector<PortraitRow>& rows,
-        const std::vector<Character*>& chars,
-        ListKind kind)
+    void LayoutRows(MyGUI::ScrollView* scroll, std::vector<PortraitRow>& rows)
     {
+        if (!scroll || !g_metrics) return;
+        const int gap = NativeUI::Spacing(g_metrics);
+        const int body = (std::max)(1, g_metrics->getFontHeight());
+        const int offset = -scroll->getViewOffset().top;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const int width = (std::max)(1, scroll->getViewCoord().width);
+            int y = 0;
+            for (size_t i = 0; i < rows.size(); ++i)
+            {
+                PortraitRow& row = rows[i];
+                const int textX = kPortraitSize + 2 * gap;
+                row.label->setCoord(textX, gap, (std::max)(1, width - textX - gap), body);
+                const int labelH = (std::max)(body, row.label->getTextSize().height);
+                row.label->setSize(row.label->getWidth(), labelH);
+                row.image->setPosition(gap, gap);
+                int textH = labelH;
+                if (row.statusBack)
+                {
+                    row.statusBack->setCoord(textX, gap + labelH + gap,
+                        (std::max)(1, width - textX - gap), kStatusBarHeight);
+                    RefreshStatusBar(row.statusBack, row.statusFill, row.character);
+                    textH += gap + kStatusBarHeight;
+                }
+                int height = (std::max)(kPortraitSize, textH) + 2 * gap;
+                if (row.handlerLabel)
+                {
+                    const int hx = kHandlerPortraitSize + 2 * gap;
+                    row.handlerLabel->setCoord(hx, height, (std::max)(1, width - hx - gap), body);
+                    const int handlerH = (std::max)(body, row.handlerLabel->getTextSize().height);
+                    row.handlerLabel->setSize(row.handlerLabel->getWidth(), handlerH);
+                    row.handlerImage->setPosition(gap, height);
+                    height += (std::max)(kHandlerPortraitSize, handlerH) + gap;
+                }
+                row.root->setCoord(0, y, width, height);
+                y += height + gap;
+            }
+            scroll->setCanvasSize(width, (std::max)(y, scroll->getViewCoord().height));
+        }
+        scroll->setViewOffset(MyGUI::IntPoint(0, -LeaderboardLayout::ClampOffset(offset,
+            scroll->getCanvasSize().height, scroll->getViewCoord().height)));
+    }
+
+    void RebuildList(MyGUI::ScrollView* scroll, std::vector<PortraitRow>& rows,
+        const std::vector<Character*>& chars, ListKind kind)
+    {
+        if (!scroll) return;
+        const int offset = -scroll->getViewOffset().top;
         ClearScrollChildren(scroll);
         rows.clear();
-        if (!scroll)
-            return;
-
-        MyGUI::IntCoord view = scroll->getViewCoord();
-        int width = view.width;
-        if (width < 80)
-            width = 180;
-
-        const int canvasH = static_cast<int>(chars.size()) * kRowH;
-        const int maxOffset = canvasH > view.height ? canvasH - view.height : 0;
-        int& logicalOffset = g_listScrollOffset[static_cast<int>(kind)];
-        if (logicalOffset < 0)
-            logicalOffset = 0;
-        else if (logicalOffset > maxOffset)
-            logicalOffset = maxOffset;
-
-        // Kenshi's bundled MyGUI does not reliably apply ScrollView view offsets
-        // to dynamically-created children. Keep a fixed clipped canvas and move
-        // the row widgets ourselves using logicalOffset.
-        scroll->setViewOffset(MyGUI::IntPoint(0, 0));
-        scroll->setCanvasSize(width, view.height);
-        scroll->setVisibleHScroll(false);
-        scroll->setVisibleVScroll(true);
-
+        const int width = (std::max)(1, scroll->getViewCoord().width);
         if (chars.empty())
         {
-            const char* emptyText = "No fighters match this filter.";
-            MyGUI::Colour emptyColour = kMuted;
-            if (kind == ListTeamA)
-            {
-                emptyText = "Drop fighters here";
-                emptyColour = kTeamA;
-            }
-            else if (kind == ListTeamB)
-            {
-                emptyText = "Drop fighters here";
-                emptyColour = kTeamB;
-            }
-            else if (kind == ListPool)
-            {
-                emptyText = "Drop fighters here";
-                emptyColour = kReady;
-            }
-
-            MyGUI::TextBox* empty = scroll->createWidget<MyGUI::TextBox>(
-                "Kenshi_TextboxStandardText",
-                12,
-                view.height / 2 - 34,
-                width - 24,
-                68,
-                MyGUI::Align::Default,
-                "PG_EmptyList");
-            empty->setCaption(emptyText);
-            empty->setFontHeight(16);
-            empty->setTextAlign(MyGUI::Align::Center);
-            empty->setNeedMouseFocus(false);
-            TintWidget(empty, emptyColour);
+            MyGUI::EditBox* empty = NativeUI::WrappedLabel(scroll,
+                MyGUI::IntCoord(8, 8, (std::max)(1, width - 16), 80), "PG_EmptyList",
+                kind == ListRoster ? "No fighters match this filter." : "Drop fighters here");
+            empty->setSize(empty->getWidth(), (std::max)(24, empty->getTextSize().height));
+            Passive(empty);
         }
-
         for (size_t i = 0; i < chars.size(); ++i)
-        {
-            if (!chars[i])
-                continue;
-            rows.push_back(MakeRow(
-                scroll, chars[i], kind, static_cast<int>(rows.size()), width));
-        }
+            if (chars[i]) rows.push_back(MakeRow(scroll, chars[i], kind, static_cast<int>(rows.size()), width));
+        LayoutRows(scroll, rows);
+        scroll->setViewOffset(MyGUI::IntPoint(0, -LeaderboardLayout::ClampOffset(offset,
+            scroll->getCanvasSize().height, scroll->getViewCoord().height)));
+
     }
 
     Character* FindRowCharacter(ListKind kind, int index)
@@ -1041,11 +803,17 @@ namespace
 
     bool PointInside(MyGUI::Widget* widget, const MyGUI::IntPoint& point)
     {
-        if (!widget || !widget->getVisible())
-            return false;
-        const MyGUI::IntCoord coord = widget->getAbsoluteCoord();
-        return point.left >= coord.left && point.left < coord.right() &&
-            point.top >= coord.top && point.top < coord.bottom();
+        if (!widget) return false;
+        // Intersect every ancestor: native scroll canvases can extend outside
+        // their viewport, and hidden compact columns are not drop targets.
+        for (MyGUI::Widget* current = widget; current; current = current->getParent())
+        {
+            if (!current->getVisible()) return false;
+            const MyGUI::IntCoord coord = current->getAbsoluteCoord();
+            if (point.left < coord.left || point.left >= coord.right() ||
+                point.top < coord.top || point.top >= coord.bottom()) return false;
+        }
+        return true;
     }
 
     Character* FindHandlerAssignment(Character* prisoner)
@@ -1235,23 +1003,7 @@ namespace
 
     void ApplyRowState(PortraitRow& row)
     {
-        if (!row.character || !row.root)
-            return;
-
-        const bool selected = row.character == g_previewChar;
-        const bool assignable = IsAssignable(row.character);
-        MyGUI::Colour rowColour = kMuted;
-        if (VectorContains(g_teamA, row.character))
-            rowColour = kTeamA;
-        else if (VectorContains(g_teamB, row.character))
-            rowColour = kTeamB;
-        else if (VectorContains(g_pool, row.character))
-            rowColour = kReady;
-        else if (!assignable)
-            rowColour = kDisabled;
-        TintWidget(row.root, selected ? kAmber : rowColour);
-        if (row.label)
-            TintWidget(row.label, selected ? kAmber : (assignable ? kTextPrimary : kDisabled));
+        if (row.root) static_cast<MyGUI::Button*>(row.root)->setStateSelected(row.character == g_previewChar);
     }
 
     void RefreshRowStates()
@@ -1350,28 +1102,6 @@ namespace
             AssignCharacter(c);
     }
 
-    void OnPortraitRowHover(MyGUI::Widget* sender, MyGUI::Widget* /*oldFocus*/)
-    {
-        ListKind kind = ListRoster;
-        int index = 0;
-        if (!DecodeRow(sender, kind, index))
-            return;
-        PortraitRow* row = FindPortraitRow(kind, index);
-        if (row && row->root)
-            TintWidget(row->root, kAmber);
-    }
-
-    void OnPortraitRowLeave(MyGUI::Widget* sender, MyGUI::Widget* /*newFocus*/)
-    {
-        ListKind kind = ListRoster;
-        int index = 0;
-        if (!DecodeRow(sender, kind, index))
-            return;
-        PortraitRow* row = FindPortraitRow(kind, index);
-        if (row)
-            ApplyRowState(*row);
-    }
-
     MyGUI::ScrollView* ScrollForListKind(ListKind kind)
     {
         if (kind == ListRoster)
@@ -1381,17 +1111,6 @@ namespace
         if (kind == ListTeamB)
             return g_teamBScroll;
         return g_poolScroll;
-    }
-
-    std::vector<PortraitRow>* RowsForListKind(ListKind kind)
-    {
-        if (kind == ListRoster)
-            return &g_rosterRows;
-        if (kind == ListTeamA)
-            return &g_teamARows;
-        if (kind == ListTeamB)
-            return &g_teamBRows;
-        return &g_poolRows;
     }
 
     ListKind ListKindForScroll(MyGUI::ScrollView* scroll)
@@ -1407,92 +1126,18 @@ namespace
 
     void ScrollListBy(MyGUI::ScrollView* scroll, int pixels)
     {
-        if (!scroll)
-            return;
-        const ListKind kind = ListKindForScroll(scroll);
-        std::vector<PortraitRow>* rows = RowsForListKind(kind);
-        if (!rows)
-            return;
+        if (!scroll) return;
+        const int offset = LeaderboardLayout::ClampOffset(-scroll->getViewOffset().top - pixels,
+            scroll->getCanvasSize().height, scroll->getViewCoord().height);
+        scroll->setViewOffset(MyGUI::IntPoint(0, -offset));
 
-        const MyGUI::IntCoord view = scroll->getViewCoord();
-        const int contentHeight = static_cast<int>(rows->size()) * kRowH;
-        const int maxOffset =
-            contentHeight > view.height ? contentHeight - view.height : 0;
-        int& offset = g_listScrollOffset[static_cast<int>(kind)];
-        offset -= pixels;
-        if (offset < 0)
-            offset = 0;
-        else if (offset > maxOffset)
-            offset = maxOffset;
-
-        for (size_t i = 0; i < rows->size(); ++i)
-        {
-            PortraitRow& row = (*rows)[i];
-            if (row.root)
-                row.root->setPosition(
-                    0, static_cast<int>(i) * kRowH - offset);
-        }
     }
 
     void UpdateScrollButtonsForKind(ListKind kind)
     {
         MyGUI::ScrollView* scroll = ScrollForListKind(kind);
-        MyGUI::Button* up = NULL;
-        MyGUI::Button* down = NULL;
-        if (kind == ListRoster)
-        {
-            up = g_rosterScrollUp;
-            down = g_rosterScrollDown;
-        }
-        else if (kind == ListTeamA)
-        {
-            up = g_teamAScrollUp;
-            down = g_teamAScrollDown;
-        }
-        else if (kind == ListTeamB)
-        {
-            up = g_teamBScrollUp;
-            down = g_teamBScrollDown;
-        }
-        else
-        {
-            up = g_poolScrollUp;
-            down = g_poolScrollDown;
-        }
-        if (!scroll || !up || !down)
-            return;
-
-        std::vector<PortraitRow>* rows = RowsForListKind(kind);
-        const MyGUI::IntCoord view = scroll->getViewCoord();
-        const int contentHeight =
-            rows ? static_cast<int>(rows->size()) * kRowH : 0;
-        const int range = contentHeight > view.height ?
-            contentHeight - view.height : 0;
-        const int offset = g_listScrollOffset[static_cast<int>(kind)];
-        const bool canUp = range > 0 && offset > 0;
-        const bool canDown = range > 0 && offset < range;
-        up->setEnabled(canUp);
-        down->setEnabled(canDown);
-        up->setTextColour(canUp ? kTextPrimary : kDisabled);
-        down->setTextColour(canDown ? kTextPrimary : kDisabled);
-        up->upLayerItem();
-        down->upLayerItem();
-    }
-
-    void OnScrollButton(MyGUI::Widget* sender)
-    {
-        if (!sender)
-            return;
-        const std::string& tag = sender->getUserString("scroll");
-        int kindInt = 0;
-        int direction = 0;
-        if (tag.empty() ||
-            sscanf_s(tag.c_str(), "%d:%d", &kindInt, &direction) != 2)
-            return;
-        ScrollListBy(
-            ScrollForListKind(static_cast<ListKind>(kindInt)),
-            direction < 0 ? -kRowH : kRowH);
-        UpdateScrollButtonsForKind(static_cast<ListKind>(kindInt));
+        if (scroll) scroll->setViewOffset(MyGUI::IntPoint(0, -LeaderboardLayout::ClampOffset(
+            -scroll->getViewOffset().top, scroll->getCanvasSize().height, scroll->getViewCoord().height)));
     }
 
     void OnPortraitRowWheel(MyGUI::Widget* sender, int rel)
@@ -1514,36 +1159,35 @@ namespace
 
     void ResetDropZoneVisuals()
     {
-        TintWidget(g_teamASurface, kTeamA);
-        TintWidget(g_teamBSurface, kTeamB);
-        TintWidget(g_poolSurface, kReady);
+        MyGUI::TextBox* labels[] = {g_lblTeamA, g_lblTeamB, g_lblPool};
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!labels[i]) continue;
+            const std::string caption = labels[i]->getCaption().asUTF8();
+            const size_t line = caption.find('\n');
+            if (line != std::string::npos) labels[i]->setCaption(caption.substr(0, line));
+        }
     }
 
     void ApplyDragHighlights(Character* c, const MyGUI::IntPoint& point)
     {
-        const bool valid = IsAssignable(c) &&
-            !SparSession::IsActive() && !ArenaIngress::IsPending() &&
-            !PrisonerUtil::IsReturning();
-
+        const bool valid = IsAssignable(c) && !SparSession::IsActive() &&
+            !ArenaIngress::IsPending() && !PrisonerUtil::IsReturning();
         ResetDropZoneVisuals();
         RefreshRowStates();
-        PortraitRow* prisonerTarget = FindAssignedPrisonerRowAtPoint(point);
-        if (prisonerTarget)
+        PortraitRow* target = FindAssignedPrisonerRowAtPoint(point);
+        if (target)
         {
-            const bool validHandler = valid && IsHandlerCandidate(c);
-            TintWidget(prisonerTarget->root, validHandler ? kAmber : kDanger);
-            if (prisonerTarget->handlerLabel)
-                TintWidget(
-                    prisonerTarget->handlerLabel, validHandler ? kAmber : kDanger);
+            const bool handler = valid && IsHandlerCandidate(c);
+            static_cast<MyGUI::Button*>(target->root)->setStateSelected(handler);
+            if (g_status) g_status->setCaption(handler ? "Release to assign handler." : "Cannot assign this handler.");
             return;
         }
-
-        if (IsTeamUiMode() && PointInside(g_teamAScroll, point))
-            TintWidget(g_teamASurface, valid ? kAmber : kDanger);
-        else if (IsTeamUiMode() && PointInside(g_teamBScroll, point))
-            TintWidget(g_teamBSurface, valid ? kAmber : kDanger);
-        else if (!IsTeamUiMode() && PointInside(g_poolScroll, point))
-            TintWidget(g_poolSurface, valid ? kAmber : kDanger);
+        MyGUI::TextBox* heading = NULL;
+        if (IsTeamUiMode() && PointInside(g_teamAScroll, point)) heading = g_lblTeamA;
+        else if (IsTeamUiMode() && PointInside(g_teamBScroll, point)) heading = g_lblTeamB;
+        else if (!IsTeamUiMode() && PointInside(g_poolScroll, point)) heading = g_lblPool;
+        if (heading) heading->setCaption(heading->getCaption() + (valid ? "\nRelease to assign" : "\nCannot assign"));
     }
 
     void RefreshPointerHighlights()
@@ -1565,9 +1209,6 @@ namespace
         }
 
         RefreshRowStates();
-        PortraitRow* hovered = FindPortraitRowAtPoint(point);
-        if (hovered && hovered->root)
-            TintWidget(hovered->root, kAmber);
     }
 
     void OnPortraitRowDrag(
@@ -1655,7 +1296,7 @@ namespace
 
     void UpdateDestHighlight();
     void UpdateLocationHighlight();
-    void UpdateKoEliminationButton();
+    void UpdateMedicalProtocolButton();
     void RefreshStatusAndButtons();
 
     void UpdateBalanceMenuVisibility()
@@ -1679,18 +1320,6 @@ namespace
             g_teamAScroll->setVisible(teamMode);
         if (g_teamBScroll)
             g_teamBScroll->setVisible(teamMode);
-        if (g_teamASurface)
-            g_teamASurface->setVisible(teamMode);
-        if (g_teamBSurface)
-            g_teamBSurface->setVisible(teamMode);
-        if (g_teamAScrollUp)
-            g_teamAScrollUp->setVisible(teamMode);
-        if (g_teamAScrollDown)
-            g_teamAScrollDown->setVisible(teamMode);
-        if (g_teamBScrollUp)
-            g_teamBScrollUp->setVisible(teamMode);
-        if (g_teamBScrollDown)
-            g_teamBScrollDown->setVisible(teamMode);
         if (g_lblTeamA)
             g_lblTeamA->setVisible(teamMode);
         if (g_lblTeamB)
@@ -1699,69 +1328,36 @@ namespace
         {
             g_btnDestA->setVisible(true);
             g_btnDestA->setCaption(teamMode ? "Assign to Team A" : "Add Selected Fighter");
-            if (!teamMode)
-            {
-                TintWidget(g_btnDestA, kReady);
-                g_btnDestA->setTextColour(kReady);
-            }
+
         }
         if (g_btnDestB)
             g_btnDestB->setVisible(teamMode);
         UpdateBalanceMenuVisibility();
         if (g_lblDest)
-            g_lblDest->setVisible(false);
+            g_lblDest->setVisible(true);
 
         const bool poolMode = !teamMode;
         if (g_poolScroll)
             g_poolScroll->setVisible(poolMode);
-        if (g_poolSurface)
-            g_poolSurface->setVisible(poolMode);
-        if (g_poolScrollUp)
-            g_poolScrollUp->setVisible(poolMode);
-        if (g_poolScrollDown)
-            g_poolScrollDown->setVisible(poolMode);
         if (g_lblPool)
             g_lblPool->setVisible(poolMode);
 
         if (g_btnRemove)
             g_btnRemove->setVisible(true);
 
-        if (g_modeAvB)
-        {
-            TintWidget(g_modeAvB, (g_uiMode == UiAvB) ? kBrass : kMuted);
-            g_modeAvB->setTextColour((g_uiMode == UiAvB) ? kAmber : kTextPrimary);
-        }
-        if (g_modeTeams1v1)
-        {
-            TintWidget(g_modeTeams1v1, (g_uiMode == UiTeams1v1) ? kBrass : kMuted);
-            g_modeTeams1v1->setTextColour(
-                (g_uiMode == UiTeams1v1) ? kAmber : kTextPrimary);
-        }
-        if (g_modeLast)
-        {
-            TintWidget(g_modeLast, (g_uiMode == UiLastStanding) ? kBrass : kMuted);
-            g_modeLast->setTextColour(
-                (g_uiMode == UiLastStanding) ? kAmber : kTextPrimary);
-        }
-
+        if (g_modeAvB) g_modeAvB->setStateSelected(g_uiMode == UiAvB);
+        if (g_modeTeams1v1) g_modeTeams1v1->setStateSelected(g_uiMode == UiTeams1v1);
+        if (g_modeLast) g_modeLast->setStateSelected(g_uiMode == UiLastStanding);
         UpdateLocationHighlight();
-        UpdateKoEliminationButton();
         UpdateDestHighlight();
     }
 
     void UpdateLocationHighlight()
     {
-        const bool arena = (ArenaIngress::GetLocationMode() == ArenaIngress::LocationArena);
-        if (g_locArena)
-        {
-            TintWidget(g_locArena, arena ? kBrass : kMuted);
-            g_locArena->setTextColour(arena ? kAmber : kTextPrimary);
-        }
-        if (g_locBanner)
-        {
-            TintWidget(g_locBanner, arena ? kMuted : kBrass);
-            g_locBanner->setTextColour(arena ? kTextPrimary : kAmber);
-        }
+        const ArenaIngress::LocationMode location = ArenaIngress::GetLocationMode();
+        if (g_locArena) g_locArena->setStateSelected(location == ArenaIngress::LocationArena);
+        if (g_locSmallArena) g_locSmallArena->setStateSelected(location == ArenaIngress::LocationSmallArena);
+        if (g_locBanner) g_locBanner->setStateSelected(location == ArenaIngress::LocationBanner);
     }
 
     void OnLocationArena(MyGUI::Widget* /*sender*/)
@@ -1784,77 +1380,182 @@ namespace
         RefreshStatusAndButtons();
     }
 
-    void UpdateKoEliminationButton()
+    void OnLocationSmallArena(MyGUI::Widget* /*sender*/)
     {
-        if (!g_koEliminationButton)
+        if (ArenaIngress::IsPending() || SparSession::IsActive())
             return;
-
-        if (g_uiMode == UiTeams1v1)
-        {
-            g_koEliminationButton->setCaption("KO Elimination: ALWAYS ON");
-            TintWidget(g_koEliminationButton, kBrass);
-            g_koEliminationButton->setTextColour(kAmber);
-            return;
-        }
-
-        g_koEliminationButton->setCaption(
-            g_koEliminationEnabled
-                ? "KO Elimination: ON"
-                : "KO Elimination: OFF");
-        TintWidget(
-            g_koEliminationButton,
-            g_koEliminationEnabled ? kBrass : kMuted);
-        g_koEliminationButton->setTextColour(
-            g_koEliminationEnabled ? kAmber : kTextPrimary);
-    }
-
-    void OnKoEliminationToggle(MyGUI::Widget* /*sender*/)
-    {
-        if (ArenaIngress::IsPending() ||
-            SparSession::IsActive() ||
-            g_uiMode == UiTeams1v1)
-        {
-            return;
-        }
-
-        g_koEliminationEnabled = !g_koEliminationEnabled;
-        SparSession::SetKoEliminationEnabled(g_koEliminationEnabled);
-        UpdateKoEliminationButton();
+        ArenaIngress::SetLocationMode(ArenaIngress::LocationSmallArena);
+        UpdateLocationHighlight();
         RefreshSummary();
         RefreshStatusAndButtons();
     }
 
-    void UpdateDestHighlight()
+    const char* GetMedicalProtocolTip()
     {
-        if (!IsTeamUiMode())
+        switch (g_medicalProtocol)
+        {
+        case ArenaMedical::Bloodsport:
+            return "No treatment until the match ends. No auto prisoner aid.";
+        case ArenaMedical::RingsideAid:
+        default:
+            return "No aid for active fighters; OK once eliminated. Prisoners get stabilized.";
+        }
+    }
+
+    void HideSettingsTip()
+    {
+        g_settingsTipOwner = NULL;
+        if (g_settingsTip)
+            g_settingsTip->setVisible(false);
+    }
+
+    void PlaceSettingsTip(const MyGUI::IntPoint& absolutePoint)
+    {
+        if (!g_settingsTip || !g_window)
             return;
 
-        if (g_btnDestA)
+        const MyGUI::IntPoint windowPos = g_window->getClientWidget()->getAbsolutePosition();
+        const MyGUI::IntSize tipSize = g_settingsTip->getSize();
+        const MyGUI::IntSize windowSize = g_window->getClientWidget()->getSize();
+
+        int left = absolutePoint.left - windowPos.left + 14;
+        int top = absolutePoint.top - windowPos.top + 18;
+        if (left + tipSize.width > windowSize.width - 8)
+            left = absolutePoint.left - windowPos.left - tipSize.width - 8;
+        if (top + tipSize.height > windowSize.height - 8)
+            top = absolutePoint.top - windowPos.top - tipSize.height - 8;
+        if (left < 8)
+            left = 8;
+        if (top < 8)
+            top = 8;
+
+        g_settingsTip->setPosition(left, top);
+    }
+
+    void ShowSettingsTip(MyGUI::Widget* owner, const MyGUI::IntPoint& absolutePoint)
+    {
+        if (!g_settingsTip || !owner)
+            return;
+
+        const std::string& tip = owner->getUserString("tip");
+        if (tip.empty())
         {
-            TintWidget(g_btnDestA, (g_dest == DestTeamA) ? kBrass : kMuted);
-            g_btnDestA->setTextColour(
-                (g_dest == DestTeamA) ? kAmber : kTextPrimary);
+            HideSettingsTip();
+            return;
         }
-        if (g_btnDestB)
+
+        g_settingsTipOwner = owner;
+        g_settingsTip->setCaption(tip);
+        const int gap = NativeUI::Spacing(g_metrics);
+        const MyGUI::IntSize clientSize = g_window->getClientWidget()->getSize();
+        const int width = (std::min)(clientSize.width - 2 * gap, g_metrics->getFontHeight() * 28);
+        g_settingsTip->setSize((std::max)(1, width), g_metrics->getFontHeight() * 3);
+        g_settingsTip->setSize((std::max)(1, width), (std::min)(clientSize.height - 2 * gap,
+            g_settingsTip->getTextSize().height + 3 * gap));
+        PlaceSettingsTip(absolutePoint);
+        g_settingsTip->setVisible(true);
+        g_settingsTip->upLayerItem();
+    }
+
+    void OnSettingsToolTip(MyGUI::Widget* sender, const MyGUI::ToolTipInfo& info)
+    {
+        if (info.type == MyGUI::ToolTipInfo::Hide)
         {
-            TintWidget(g_btnDestB, (g_dest == DestTeamB) ? kBrass : kMuted);
-            g_btnDestB->setTextColour(
-                (g_dest == DestTeamB) ? kAmber : kTextPrimary);
+            if (g_settingsTipOwner == sender)
+                HideSettingsTip();
+            return;
         }
-        if (g_lblDest)
+
+        if (info.type == MyGUI::ToolTipInfo::Show)
         {
-            g_lblDest->setCaption(g_dest == DestTeamA
-                ? "Click roster → Team A"
-                : "Click roster → Team B");
-            TintWidget(g_lblDest, g_dest == DestTeamA ? kTeamA : kTeamB);
-            g_lblDest->setCaption(g_dest == DestTeamA
-                ? "Double-click assigns to Team A"
-                : "Double-click assigns to Team B");
+            ShowSettingsTip(sender, info.point);
+            return;
         }
-        if (g_lblTeamA)
-            TintWidget(g_lblTeamA, (g_dest == DestTeamA) ? kBrass : kTeamA);
-        if (g_lblTeamB)
-            TintWidget(g_lblTeamB, (g_dest == DestTeamB) ? kBrass : kTeamB);
+
+        if (info.type == MyGUI::ToolTipInfo::Move &&
+            g_settingsTip &&
+            g_settingsTip->getVisible() &&
+            g_settingsTipOwner == sender)
+        {
+            PlaceSettingsTip(info.point);
+        }
+    }
+
+    void BindSettingsToolTip(MyGUI::Button* button)
+    {
+        if (!button)
+            return;
+        button->setNeedToolTip(true);
+        button->eventToolTip += MyGUI::newDelegate(OnSettingsToolTip);
+    }
+
+    void RefreshSettingsTipIfShowing(MyGUI::Widget* owner)
+    {
+        if (!g_settingsTip ||
+            !g_settingsTip->getVisible() ||
+            g_settingsTipOwner != owner ||
+            !owner)
+        {
+            return;
+        }
+
+        const std::string& tip = owner->getUserString("tip");
+        if (tip.empty())
+        {
+            HideSettingsTip();
+            return;
+        }
+
+        g_settingsTip->setCaption(tip);
+        const int gap = NativeUI::Spacing(g_metrics);
+        const MyGUI::IntSize clientSize = g_window->getClientWidget()->getSize();
+        const int width = (std::min)(clientSize.width - 2 * gap, g_metrics->getFontHeight() * 28);
+        g_settingsTip->setSize((std::max)(1, width), g_metrics->getFontHeight() * 3);
+        g_settingsTip->setSize((std::max)(1, width), (std::min)(clientSize.height - 2 * gap,
+            g_settingsTip->getTextSize().height + 3 * gap));
+    }
+
+    void UpdateMedicalProtocolButton()
+    {
+        if (!g_medicalProtocolButton)
+            return;
+
+        std::string caption = "Medical: ";
+        caption += ArenaMedical::GetProtocolName(g_medicalProtocol);
+        g_medicalProtocolButton->setCaption(caption);
+
+        g_medicalProtocolButton->setUserString("tip", GetMedicalProtocolTip());
+        RefreshSettingsTipIfShowing(g_medicalProtocolButton);
+    }
+
+    void OnMedicalProtocolToggle(MyGUI::Widget* /*sender*/)
+    {
+        if (ArenaIngress::IsPending() || SparSession::IsActive())
+            return;
+
+        g_medicalProtocol = ArenaMedical::NextProtocol(g_medicalProtocol);
+        ArenaMedical::SetProtocol(g_medicalProtocol);
+        UpdateMedicalProtocolButton();
+        RefreshSummary();
+        RefreshStatusAndButtons();
+    }
+
+    void OnRecruitPrisoners(MyGUI::Widget* /*sender*/)
+    {
+        if (g_window)
+        {
+            HideSettingsTip();
+            g_window->setVisible(false);
+        }
+        PrisonerRecruitmentUI::Show();
+    }
+
+    void UpdateDestHighlight()
+    {
+        if (g_btnDestA) g_btnDestA->setStateSelected(!IsTeamUiMode() || g_dest == DestTeamA);
+        if (g_btnDestB) g_btnDestB->setStateSelected(IsTeamUiMode() && g_dest == DestTeamB);
+        if (g_lblDest) g_lblDest->setCaption(!IsTeamUiMode() ? "Double-click adds to the pool" :
+            g_dest == DestTeamA ? "Double-click assigns to Team A" : "Double-click assigns to Team B");
     }
 
     void SwitchMode(UiMode newMode)
@@ -1903,12 +1604,6 @@ namespace
             if (!c)
                 continue;
             bool filterMatch = true;
-            if (g_rosterFilter == FilterReady)
-                filterMatch = IsAssignable(c) && !IsAssigned(c);
-            else if (g_rosterFilter == FilterAssigned)
-                filterMatch = IsAssigned(c);
-            else if (g_rosterFilter == FilterUnavailable)
-                filterMatch = !IsAssignable(c);
 
             if (filterMatch &&
                 (query.empty() || LowerText(c->getName()).find(query) != std::string::npos))
@@ -1931,49 +1626,6 @@ namespace
         }
         UpdateScrollButtonsForKind(ListRoster);
     }
-
-    void UpdateRosterFilterHighlight()
-    {
-        if (g_filterAll)
-        {
-            TintWidget(g_filterAll, g_rosterFilter == FilterAll ? kAmber : kMuted);
-            g_filterAll->setTextColour(
-                g_rosterFilter == FilterAll ? kAmber : kTextPrimary);
-        }
-        if (g_filterReady)
-        {
-            TintWidget(g_filterReady, g_rosterFilter == FilterReady ? kReady : kMuted);
-            g_filterReady->setTextColour(
-                g_rosterFilter == FilterReady ? kReady : kTextPrimary);
-        }
-        if (g_filterAssigned)
-        {
-            TintWidget(g_filterAssigned, g_rosterFilter == FilterAssigned ? kAmber : kMuted);
-            g_filterAssigned->setTextColour(
-                g_rosterFilter == FilterAssigned ? kAmber : kTextPrimary);
-        }
-        if (g_filterUnavailable)
-        {
-            TintWidget(
-                g_filterUnavailable,
-                g_rosterFilter == FilterUnavailable ? kDanger : kMuted);
-            g_filterUnavailable->setTextColour(
-                g_rosterFilter == FilterUnavailable ? kDanger : kTextPrimary);
-        }
-    }
-
-    void SetRosterFilter(RosterFilter filter)
-    {
-        g_rosterFilter = filter;
-        g_listScrollOffset[static_cast<int>(ListRoster)] = 0;
-        UpdateRosterFilterHighlight();
-        RefreshRosterList();
-    }
-
-    void OnFilterAll(MyGUI::Widget* /*sender*/) { SetRosterFilter(FilterAll); }
-    void OnFilterReady(MyGUI::Widget* /*sender*/) { SetRosterFilter(FilterReady); }
-    void OnFilterAssigned(MyGUI::Widget* /*sender*/) { SetRosterFilter(FilterAssigned); }
-    void OnFilterUnavailable(MyGUI::Widget* /*sender*/) { SetRosterFilter(FilterUnavailable); }
 
     float AverageCombatSkill(const std::vector<Character*>& fighters)
     {
@@ -2035,7 +1687,7 @@ namespace
         if (!sender || g_searchPlaceholderActive)
             return;
         g_rosterQuery = sender->getOnlyText().asUTF8();
-        g_listScrollOffset[static_cast<int>(ListRoster)] = 0;
+        if (g_rosterScroll) g_rosterScroll->setViewOffset(MyGUI::IntPoint());
         RefreshRosterList();
     }
 
@@ -2045,8 +1697,7 @@ namespace
             return;
         g_searchPlaceholderActive = false;
         g_rosterSearch->setOnlyText("");
-        g_rosterSearch->setTextColour(kTextPrimary);
-        TintWidget(g_rosterSearchSurface, kAmber);
+
     }
 
     void OnRosterSearchMousePressed(
@@ -2071,15 +1722,14 @@ namespace
             return;
         if (!g_rosterSearch->getOnlyText().empty())
         {
-            TintWidget(g_rosterSearchSurface, kMuted);
+
             return;
         }
         g_searchPlaceholderActive = true;
         g_rosterQuery.clear();
-        g_listScrollOffset[static_cast<int>(ListRoster)] = 0;
+        if (g_rosterScroll) g_rosterScroll->setViewOffset(MyGUI::IntPoint());
         g_rosterSearch->setOnlyText("Search fighters...");
-        g_rosterSearch->setTextColour(kMuted);
-        TintWidget(g_rosterSearchSurface, kMuted);
+
         RefreshRosterList();
     }
 
@@ -2104,7 +1754,8 @@ namespace
             caption += reason;
         }
         row.label->setCaption(caption);
-        TintWidget(row.label, reason.empty() ? kTextPrimary : kMuted);
+        RefreshStatusBar(row.statusBack, row.statusFill, row.character);
+
         ApplyRowState(row);
     }
 
@@ -2123,15 +1774,23 @@ namespace
             g_previewMeta->setCaption(FighterDetailLabel(g_previewChar));
     }
 
+    void RefreshRosterStatusBars()
+    {
+        for (size_t i = 0; i < g_rosterRows.size(); ++i)
+            RefreshStatusBar(g_rosterRows[i].statusBack, g_rosterRows[i].statusFill,
+                g_rosterRows[i].character);
+    }
+
     void RefreshSummary()
     {
         if (!g_summary)
             return;
 
-        const char* location =
-            ArenaIngress::GetLocationMode() == ArenaIngress::LocationArena
-                ? "Arena"
-                : "Banner";
+        const char* location = "Banner";
+        if (ArenaIngress::GetLocationMode() == ArenaIngress::LocationArena)
+            location = "Arena";
+        else if (ArenaIngress::GetLocationMode() == ArenaIngress::LocationSmallArena)
+            location = "Small Arena";
         char text[320];
         if (g_uiMode == UiAvB)
         {
@@ -2165,6 +1824,8 @@ namespace
 
     bool CanStart()
     {
+        if (TownArena::IsBusy() || TownArena::HasBooking())
+            return false;
         if (SparSession::IsActive())
             return false;
         if (ArenaIngress::IsPending())
@@ -2232,6 +1893,8 @@ namespace
             return "[...] Fighters are moving to the match location.";
         if (SparSession::IsActive())
             return "[LIVE] A spar is currently running.";
+        if (PrisonerUtil::IsReturning())
+            return "Returning prisoners to their cages...";
         if (!ArenaIngress::HasLocationSite())
             return ArenaIngress::GetMissingLocationMessage();
         if (IsTeamUiMode() && (g_teamA.empty() || g_teamB.empty()))
@@ -2261,8 +1924,11 @@ namespace
         const bool active = SparSession::IsActive();
         const bool pending = ArenaIngress::IsPending();
         const bool edit = !active && !pending;
+        const bool canStart = edit && CanStart();
 
-        if (!active)
+        if (active)
+            RefreshRosterStatusBars();
+        else
             RefreshAvailabilityLabels();
 
         if (g_status)
@@ -2286,24 +1952,21 @@ namespace
         // Keep validation adjacent to the primary action; selection detail lives above.
         if (g_status && !active && !pending)
             g_status->setCaption(ValidationMessage());
-        if (g_status)
-            TintWidget(g_status, (!active && !pending && CanStart()) ? kReady :
-                ((active || pending) ? kMuted : kDanger));
+        if (g_status && (TownArena::IsBusy() || TownArena::HasBooking()))
+            g_status->setCaption("Arena reserved by a town event.");
 
         if (g_startButton)
         {
-            g_startButton->setVisible(!active && !pending);
-            g_startButton->setEnabled(edit && CanStart());
-            TintWidget(g_startButton, CanStart() ? kAmber : kDisabled);
-            g_startButton->setTextColour(CanStart() ? kAmber : kDisabled);
+            g_startButton->setVisible(!active && !pending && !TownArena::IsBusy());
+            g_startButton->setEnabled(canStart);
+
         }
         if (g_stopButton)
         {
-            g_stopButton->setVisible(active || pending);
-            g_stopButton->setEnabled(active || pending);
-            g_stopButton->setCaption(pending ? "Cancel Walk-in" : "Stop Spar");
-            TintWidget(g_stopButton, kDanger);
-            g_stopButton->setTextColour(kTextPrimary);
+            g_stopButton->setVisible(active || pending || TownArena::IsBusy());
+            g_stopButton->setEnabled(active || pending || TownArena::IsBusy());
+            g_stopButton->setCaption(pending ? "Cancel Match Start" : "Stop Fight");
+
         }
 
         if (g_modeAvB)
@@ -2314,10 +1977,10 @@ namespace
             g_modeLast->setEnabled(edit);
         if (g_locArena)
             g_locArena->setEnabled(edit);
+        if (g_locSmallArena)
+            g_locSmallArena->setEnabled(edit);
         if (g_locBanner)
             g_locBanner->setEnabled(edit);
-        if (g_koEliminationButton)
-            g_koEliminationButton->setEnabled(edit && g_uiMode != UiTeams1v1);
         if (g_btnDestA)
             g_btnDestA->setEnabled(edit && g_previewChar && IsAssignable(g_previewChar));
         if (g_btnDestB)
@@ -2343,37 +2006,12 @@ namespace
                 g_presetButtons[i]->setEnabled(edit);
         }
 
-        if (g_btnDestA)
-            g_btnDestA->setTextColour(
-                g_btnDestA->getEnabled() ? (IsTeamUiMode() &&
-                    g_dest == DestTeamA ? kAmber : kTextPrimary) : kDisabled);
-        if (g_btnDestB)
-            g_btnDestB->setTextColour(
-                g_btnDestB->getEnabled() ?
-                    (g_dest == DestTeamB ? kAmber : kTextPrimary) : kDisabled);
-        if (g_btnAutoBalance)
-            g_btnAutoBalance->setTextColour(
-                g_btnAutoBalance->getEnabled() ? kTextPrimary : kDisabled);
-        if (g_btnBalanceSkill)
-            g_btnBalanceSkill->setTextColour(
-                g_btnBalanceSkill->getEnabled() ? kTextPrimary : kDisabled);
-        if (g_btnBalanceRating)
-            g_btnBalanceRating->setTextColour(
-                g_btnBalanceRating->getEnabled() ? kTextPrimary : kDisabled);
-        if (g_btnSwapTeams)
-            g_btnSwapTeams->setTextColour(
-                g_btnSwapTeams->getEnabled() ? kTextPrimary : kDisabled);
-        if (g_btnClearTeams)
-            g_btnClearTeams->setTextColour(
-                g_btnClearTeams->getEnabled() ? kTextPrimary : kDisabled);
-        if (g_btnRemove)
-            g_btnRemove->setTextColour(
-                g_btnRemove->getEnabled() ? kTextPrimary : kDisabled);
         RefreshCompactDrawers();
     }
 
     void RefreshAll()
     {
+        if (!g_window) return;
         RefreshRosterCaches();
 
         // Drop stale assignment pointers.
@@ -2496,9 +2134,7 @@ namespace
                 i + 1,
                 g_setupPresets[i].valid ? " *" : "");
             g_presetButtons[i]->setCaption(caption);
-            TintWidget(
-                g_presetButtons[i],
-                g_setupPresets[i].valid ? kBrass : kMuted);
+
         }
     }
 
@@ -2511,7 +2147,7 @@ namespace
         preset.mode = g_uiMode;
         preset.destination = g_dest;
         preset.location = ArenaIngress::GetLocationMode();
-        preset.koElimination = g_koEliminationEnabled;
+        preset.medicalProtocol = g_medicalProtocol;
         preset.teamA = g_teamA;
         preset.teamB = g_teamB;
         preset.pool = g_pool;
@@ -2537,7 +2173,7 @@ namespace
         const SetupPreset& preset = g_setupPresets[index];
         g_uiMode = preset.mode;
         g_dest = preset.destination;
-        g_koEliminationEnabled = preset.koElimination;
+        g_medicalProtocol = preset.medicalProtocol;
         g_teamA = preset.teamA;
         g_teamB = preset.teamB;
         g_pool = preset.pool;
@@ -2545,11 +2181,12 @@ namespace
         RemoveMissingPresetFighters(g_teamB);
         RemoveMissingPresetFighters(g_pool);
         ArenaIngress::SetLocationMode(preset.location);
-        SparSession::SetKoEliminationEnabled(g_koEliminationEnabled);
+        ArenaMedical::SetProtocol(g_medicalProtocol);
+        g_medicalProtocol = ArenaMedical::GetProtocol();
         SetPreview(NULL);
         UpdateModeVisibility();
         UpdateLocationHighlight();
-        UpdateKoEliminationButton();
+        UpdateMedicalProtocolButton();
         RefreshRosterList();
         RefreshAssignmentLists();
         RefreshSummary();
@@ -2752,7 +2389,7 @@ namespace
         std::vector<MatchRules::MatchTeam> teams;
         MatchRules::MatchMode mode = MatchRules::ModeTeamAvB;
         bool ok = false;
-        SparSession::SetKoEliminationEnabled(g_koEliminationEnabled);
+        ArenaMedical::SetProtocol(g_medicalProtocol);
 
         if (IsTeamUiMode())
         {
@@ -2817,7 +2454,10 @@ namespace
         if (ok)
         {
             if (g_window)
+            {
+                HideSettingsTip();
                 g_window->setVisible(false);
+            }
         }
         else
             RefreshStatusAndButtons();
@@ -2825,44 +2465,28 @@ namespace
 
     void OnStop(MyGUI::Widget* /*sender*/)
     {
+        if (TownArena::IsBusy())
+        {
+            TownArena::Cancel();
+            RefreshStatusAndButtons();
+            return;
+        }
         if (ArenaIngress::IsPending())
             ArenaIngress::Cancel();
         SparSession::Stop(SparSession::StopManual);
         RefreshStatusAndButtons();
     }
 
-    void SetColumnVisible(std::vector<MyGUI::Widget*>& widgets, bool visible)
-    {
-        for (size_t i = 0; i < widgets.size(); ++i)
-        {
-            if (widgets[i] && widgets[i]->getVisible() != visible)
-                widgets[i]->setVisible(visible);
-        }
-    }
-
     void RefreshCompactDrawers()
     {
-        if (g_rosterDrawerButton)
-            g_rosterDrawerButton->setVisible(g_compactMode);
-        if (g_settingsDrawerButton)
-            g_settingsDrawerButton->setVisible(g_compactMode);
-        if (g_titleEyebrow)
-            g_titleEyebrow->setVisible(!g_compactMode);
-
-        SetColumnVisible(
-            g_rosterColumnWidgets, !g_compactMode || g_rosterDrawerOpen);
-        SetColumnVisible(
-            g_settingsColumnWidgets, !g_compactMode || g_settingsDrawerOpen);
-        const bool settingsVisible = !g_compactMode || g_settingsDrawerOpen;
-        if (g_previewImage)
-            g_previewImage->setVisible(
-                settingsVisible && g_previewChar && g_previewChar->isValid());
-        if (settingsVisible && g_startButton && g_stopButton)
-        {
-            const bool busy = SparSession::IsActive() || ArenaIngress::IsPending();
-            g_startButton->setVisible(!busy);
-            g_stopButton->setVisible(busy);
-        }
+        if (!g_layoutReady) return;
+        g_rosterDrawerButton->setVisible(g_compactMode);
+        g_settingsDrawerButton->setVisible(g_compactMode);
+        g_rosterDrawerButton->setStateSelected(g_rosterDrawerOpen);
+        g_settingsDrawerButton->setStateSelected(g_settingsDrawerOpen);
+        g_columns[0]->setVisible(!g_compactMode || g_rosterDrawerOpen);
+        g_columns[2]->setVisible(!g_compactMode || g_settingsDrawerOpen);
+        LayoutPanel();
     }
 
     void OnToggleRosterDrawer(MyGUI::Widget* /*sender*/)
@@ -2887,405 +2511,416 @@ namespace
 
     void RefreshResponsiveMode()
     {
+        if (!g_layoutReady) return;
         MyGUI::RenderManager* render = MyGUI::RenderManager::getInstancePtr();
-        if (!render)
-            return;
-        const MyGUI::IntSize size = render->getViewSize();
-        if (size.height <= 0)
-            return;
-        const bool compact =
-            static_cast<float>(size.width) / static_cast<float>(size.height) < 1.5f;
-        if (compact == g_compactMode)
-            return;
-
-        g_compactMode = compact;
-        g_rosterDrawerOpen = false;
-        g_settingsDrawerOpen = false;
+        if (render && render->getViewSize() != g_viewSize)
+        {
+            g_viewSize = render->getViewSize();
+            g_window->setCoord(g_viewSize.width / 25, g_viewSize.height / 25,
+                g_viewSize.width * 23 / 25, g_viewSize.height * 23 / 25);
+        }
+        const bool compact = g_window->getClientWidget()->getWidth() < g_metrics->getFontHeight() * 76;
+        if (compact != g_compactMode)
+        {
+            g_compactMode = compact;
+            g_rosterDrawerOpen = false;
+            g_settingsDrawerOpen = false;
+        }
         RefreshCompactDrawers();
     }
 
-    MyGUI::ScrollView* MakeScroll(MyGUI::Widget* parent, float x, float y, float w, float h, const char* name)
+    MyGUI::TextBox* PanelLabel(MyGUI::Widget* parent, const char* name, const char* caption)
     {
-        MyGUI::ScrollView* scroll = parent->createWidgetReal<MyGUI::ScrollView>(
-            "ScrollView", x, y, w, h, MyGUI::Align::Default, name);
-        if (scroll)
+        return NativeUI::WrappedLabel(parent, MyGUI::IntCoord(0, 0, 200, 24), name, caption);
+    }
+
+    MyGUI::Button* PanelButton(MyGUI::Widget* parent, const char* name,
+        const char* caption, void (*handler)(MyGUI::Widget*))
+    {
+        MyGUI::Button* result = NativeUI::Button(parent, MyGUI::IntCoord(0, 0, 200, 32), name, caption);
+        result->eventMouseButtonClick += MyGUI::newDelegate(handler);
+        ButtonPresentation presentation;
+        presentation.button = result;
+        presentation.text = result->createWidget<MyGUI::EditBox>("Kenshi_PaintedWordWrapEmpty",
+            MyGUI::IntCoord(0, 0, 200, 32), MyGUI::Align::Default);
+        presentation.caption = caption;
+        presentation.naturalWidth = result->getTextSize().width;
+        presentation.text->setCaption(caption);
+        Passive(presentation.text);
+        result->setCaption("");
+        g_buttonPresentation.push_back(presentation);
+        return result;
+    }
+
+    ButtonPresentation& ButtonText(MyGUI::Button* button)
+    {
+        for (size_t i = 0; i < g_buttonPresentation.size(); ++i)
+            if (g_buttonPresentation[i].button == button) return g_buttonPresentation[i];
+        throw std::runtime_error("missing arena button presentation");
+    }
+
+    void SyncButtonText()
+    {
+        for (size_t i = 0; i < g_buttonPresentation.size(); ++i)
         {
-            scroll->setVisibleHScroll(false);
-            scroll->setVisibleVScroll(true);
-            scroll->setCanvasAlign(MyGUI::Align::Default);
-            TintWidget(scroll, kBgDark);
+            ButtonPresentation& item = g_buttonPresentation[i];
+            const std::string caption = item.button->getCaption().asUTF8();
+            if (caption.empty()) continue;
+            item.caption = caption;
+            item.naturalWidth = item.button->getTextSize().width;
+            item.text->setCaption(caption);
+            item.button->setCaption("");
         }
-        return scroll;
     }
 
-    MyGUI::Button* MakeButton(MyGUI::Widget* parent, float x, float y, float w, float h,
-        const char* name, const char* caption, void (*handler)(MyGUI::Widget*))
+    int PlaceLabel(MyGUI::TextBox* label, int x, int y, int width)
     {
-        MyGUI::Button* btn = parent->createWidgetReal<MyGUI::Button>(
-            "Kenshi_Button1", x, y, w, h, MyGUI::Align::Default, name);
-        btn->setCaption(caption);
-        btn->setFontHeight(16);
-        btn->setTextColour(kTextPrimary);
-        btn->setTextShadow(true);
-        btn->setTextShadowColour(MyGUI::Colour::Black);
-        btn->eventMouseButtonClick += MyGUI::newDelegate(handler);
-        return btn;
+        const int body = (std::max)(1, g_metrics->getFontHeight());
+        label->setCoord(x, y, (std::max)(1, width), body);
+        const int height = (std::max)(body, label->getTextSize().height);
+        label->setSize(label->getWidth(), height);
+        return height;
     }
 
-    MyGUI::TextBox* MakeLabel(MyGUI::Widget* parent, float x, float y, float w, float h,
-        const char* name, const char* caption)
+    MyGUI::TextBox* Heading(int column, const char* name)
     {
-        MyGUI::TextBox* lbl = parent->createWidgetReal<MyGUI::TextBox>(
-            "Kenshi_TextboxStandardText", x, y, w, h, MyGUI::Align::Default, name);
-        lbl->setCaption(caption);
-        lbl->setFontHeight(16);
-        TintWidget(lbl, kTextPrimary);
-        return lbl;
+        return g_columnContent[column]->findWidget(name)->castType<MyGUI::TextBox>();
     }
 
-    MyGUI::Button* MakeSurface(
-        MyGUI::Widget* parent, float x, float y, float w, float h, const char* name)
+    int PlaceButtons(MyGUI::Button** buttons, int count, int x, int y, int width)
     {
-        MyGUI::Button* surface = parent->createWidgetReal<MyGUI::Button>(
-            "Kenshi_Button1", x, y, w, h, MyGUI::Align::Default, name);
-        surface->setCaption("");
-        surface->setNeedMouseFocus(false);
-        TintWidget(surface, kBgDark);
-        return surface;
+        const int gap = NativeUI::Spacing(g_metrics);
+        int minWidth = 0;
+        for (int i = 0; i < count; ++i)
+            minWidth = (std::max)(minWidth, ButtonText(buttons[i]).naturalWidth + 4 * gap);
+        const int columns = (std::max)(1, (std::min)(count, (width + gap) / (minWidth + gap)));
+        const int cell = (std::max)(1, (width - (columns - 1) * gap) / columns);
+        int bottom = y;
+        for (int row = 0; row < count; row += columns)
+        {
+            int height = NativeUI::RowHeight(g_metrics, 0);
+            for (int i = row; i < (std::min)(row + columns, count); ++i)
+                height = (std::max)(height, PlaceLabel(ButtonText(buttons[i]).text,
+                    gap, gap, cell - 2 * gap) + 2 * gap);
+            for (int i = row; i < (std::min)(row + columns, count); ++i)
+                buttons[i]->setCoord(x + (i - row) * (cell + gap), bottom, cell, height);
+            bottom += height + gap;
+        }
+        return bottom - y - gap;
+    }
+
+    void LayoutColumn(int column)
+    {
+        MyGUI::ScrollView* scroll = g_columns[column];
+        const MyGUI::IntPoint offset = scroll->getViewOffset();
+        const int gap = NativeUI::Spacing(g_metrics);
+        const int body = (std::max)(1, g_metrics->getFontHeight());
+        const int buttonH = NativeUI::RowHeight(g_metrics, 0);
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const int width = (std::max)(1, scroll->getViewCoord().width - 2 * gap);
+            const int viewH = scroll->getViewCoord().height;
+            int y = gap;
+            if (column == 0)
+            {
+                y += PlaceLabel(Heading(0, "PG_LblRoster"), gap, y, width) + gap;
+                y += PlaceLabel(g_rosterCount, gap, y, width) + gap;
+                g_rosterSearch->setCoord(gap, y, width, buttonH + gap); y += buttonH + 2 * gap;
+                y += PlaceLabel(Heading(0, "PG_RosterHint"), gap, y, width) + gap;
+                const int listH = (std::max)(body * 9, viewH - y - gap);
+                g_rosterScroll->setCoord(gap, y, width, listH); y += listH + gap;
+                LayoutRows(g_rosterScroll, g_rosterRows);
+            }
+            else if (column == 1)
+            {
+                y += PlaceLabel(Heading(1, "PG_LblMode"), gap, y, width) + gap;
+                MyGUI::Button* modes[] = {g_modeAvB, g_modeTeams1v1, g_modeLast};
+                y += PlaceButtons(modes, 3, gap, y, width) + gap;
+                y += PlaceLabel(g_lblDest, gap, y, width) + gap;
+                MyGUI::Button* assign[] = {g_btnDestA, g_btnDestB};
+                y += PlaceButtons(assign, IsTeamUiMode() ? 2 : 1, gap, y, width) + gap;
+                const int listH = (std::max)(body * 9, viewH - y - body * 12);
+                if (IsTeamUiMode())
+                {
+                    const bool stacked = width < body * 32;
+                    const int half = stacked ? width : (width - gap) / 2;
+                    const int hA = PlaceLabel(g_lblTeamA, gap, y, half);
+                    if (stacked)
+                    {
+                        y += hA + gap;
+                        g_teamAScroll->setCoord(gap, y, half, listH); y += listH + gap;
+                        y += PlaceLabel(g_lblTeamB, gap, y, half) + gap;
+                        g_teamBScroll->setCoord(gap, y, half, listH); y += listH + gap;
+                    }
+                    else
+                    {
+                        const int hB = PlaceLabel(g_lblTeamB, 2 * gap + half, y, half);
+                        y += (std::max)(hA, hB) + gap;
+                        g_teamAScroll->setCoord(gap, y, half, listH);
+                        g_teamBScroll->setCoord(2 * gap + half, y, half, listH); y += listH + gap;
+                    }
+                    LayoutRows(g_teamAScroll, g_teamARows);
+                    LayoutRows(g_teamBScroll, g_teamBRows);
+                }
+                else
+                {
+                    y += PlaceLabel(g_lblPool, gap, y, width) + gap;
+                    g_poolScroll->setCoord(gap, y, width, listH); y += listH + gap;
+                    LayoutRows(g_poolScroll, g_poolRows);
+                }
+                MyGUI::Button* balance[] = {g_btnAutoBalance, g_btnBalanceSkill, g_btnBalanceRating};
+                MyGUI::Button* edit[] = {g_btnAutoBalance, g_btnSwapTeams, g_btnClearTeams};
+                MyGUI::Button* poolEdit[] = {g_btnAutoBalance, g_btnClearTeams};
+                y += PlaceButtons(g_balanceMenuOpen ? balance : IsTeamUiMode() ? edit : poolEdit,
+                    g_balanceMenuOpen || IsTeamUiMode() ? 3 : 2, gap, y, width) + gap;
+                y += PlaceLabel(Heading(1, "PG_BuilderHint"), gap, y, width) + gap;
+                y += PlaceButtons(g_presetButtons, 3, gap, y, width) + gap;
+            }
+            else
+            {
+                y += PlaceLabel(Heading(2, "PG_LblPreview"), gap, y, width) + gap;
+                g_previewImage->setCoord(gap, y, kPortraitSize, kPortraitSize);
+                const int textX = 2 * gap + kPortraitSize;
+                int textY = y;
+                textY += PlaceLabel(g_previewName, textX, textY, width - kPortraitSize - gap) + gap;
+                textY += PlaceLabel(g_previewMeta, textX, textY, width - kPortraitSize - gap) + gap;
+                y = (std::max)(textY, y + kPortraitSize + gap);
+                y += PlaceLabel(g_previewStats, gap, y, width) + gap;
+                y += PlaceButtons(&g_btnRemove, 1, gap, y, width) + gap;
+                y += PlaceLabel(Heading(2, "PG_LblSettings"), gap, y, width) + gap;
+                y += PlaceLabel(Heading(2, "PG_LblLoc"), gap, y, width) + gap;
+                MyGUI::Button* locations[] = {g_locArena, g_locSmallArena, g_locBanner};
+                y += PlaceButtons(locations, 3, gap, y, width) + gap;
+                y += PlaceButtons(&g_medicalProtocolButton, 1, gap, y, width) + gap;
+                y += PlaceLabel(Heading(2, "PG_LblSummary"), gap, y, width) + gap;
+                y += PlaceLabel(g_summary, gap, y, width) + gap;
+            }
+            g_columnContent[column]->setSize(width + 2 * gap, y);
+            scroll->setCanvasSize(width + 2 * gap, (std::max)(y, viewH));
+        }
+        scroll->setViewOffset(MyGUI::IntPoint(0, -LeaderboardLayout::ClampOffset(-offset.top,
+            scroll->getCanvasSize().height, scroll->getViewCoord().height)));
+    }
+
+    void LayoutPanel()
+    {
+        if (!g_layoutReady) return;
+        SyncButtonText();
+        MyGUI::Widget* client = g_window->getClientWidget();
+        const int gap = NativeUI::Spacing(g_metrics);
+        const int body = (std::max)(1, g_metrics->getFontHeight());
+        const int width = (std::max)(1, client->getWidth() - 2 * gap);
+        const int buttonH = NativeUI::RowHeight(g_metrics, 0);
+        const int headerH = buttonH + 2 * gap;
+        const int footerH = (std::min)(client->getHeight() / 3, body * 4 + 2 * gap);
+        const int footerY = (std::max)(headerH, client->getHeight() - footerH - gap);
+        const int contentH = (std::max)(1, footerY - headerH - gap);
+        const int actionW = (std::min)(width / 2,
+            (std::max)(ButtonText(g_stopButton).naturalWidth, ButtonText(g_startButton).naturalWidth) + 4 * gap);
+        g_status->setCoord(gap, footerY, (std::max)(1, width - actionW - gap), footerH);
+        PlaceButtons(&g_startButton, 1, gap + width - actionW, footerY, actionW);
+        PlaceButtons(&g_stopButton, 1, gap + width - actionW, footerY, actionW);
+        if (g_compactMode)
+        {
+            g_titleHero->setVisible(false);
+            MyGUI::Button* header[] = {
+                g_rosterDrawerButton,
+                g_settingsDrawerButton,
+                g_btnRecruitment
+            };
+            const int actualHeader = PlaceButtons(header, 3, gap, gap, width);
+            const int top = (std::max)(headerH, actualHeader + 2 * gap);
+            const bool drawer = g_rosterDrawerOpen || g_settingsDrawerOpen;
+            const int sideW = drawer ? (std::max)(1, width * 2 / 5) : 0;
+            g_columns[1]->setCoord(gap + (drawer ? sideW + gap : 0), top,
+                (std::max)(1, width - (drawer ? sideW + gap : 0)), (std::max)(1, footerY - top - gap));
+            g_columns[0]->setCoord(gap, top, (std::max)(1, sideW), (std::max)(1, footerY - top - gap));
+            g_columns[2]->setCoord(gap, top, (std::max)(1, sideW), (std::max)(1, footerY - top - gap));
+        }
+        else
+        {
+            g_titleHero->setVisible(true);
+            const int recruitWidth = (std::min)(width / 2,
+                ButtonText(g_btnRecruitment).naturalWidth + 4 * gap);
+            PlaceLabel(g_titleHero, gap, gap,
+                (std::max)(1, width - recruitWidth - gap));
+            PlaceButtons(&g_btnRecruitment, 1,
+                gap + width - recruitWidth, gap, recruitWidth);
+            const int sideW = (width - 2 * gap) / 4;
+            g_columns[0]->setCoord(gap, headerH, sideW, contentH);
+            g_columns[1]->setCoord(2 * gap + sideW, headerH, width - 2 * sideW - 2 * gap, contentH);
+            g_columns[2]->setCoord(gap + width - sideW, headerH, sideW, contentH);
+        }
+        for (int i = 0; i < 3; ++i)
+            if (g_columns[i]->getVisible()) LayoutColumn(i);
+    }
+
+    void DestroyPanelWidgets()
+    {
+        g_layoutReady = false;
+        if (g_window) MyGUI::Gui::getInstance().destroyWidget(g_window);
+        g_window = NULL;
+        g_titleHero = NULL;
+        g_rosterScroll = NULL;
+        g_teamAScroll = NULL;
+        g_teamBScroll = NULL;
+        g_poolScroll = NULL;
+        g_rosterSearch = NULL;
+        g_rosterCount = NULL;
+        g_modeAvB = NULL;
+        g_modeTeams1v1 = NULL;
+        g_modeLast = NULL;
+        g_locArena = NULL;
+        g_locSmallArena = NULL;
+        g_locBanner = NULL;
+        g_medicalProtocolButton = NULL;
+        g_settingsTip = NULL;
+        g_settingsTipOwner = NULL;
+        g_lblTeamA = NULL;
+        g_lblTeamB = NULL;
+        g_lblPool = NULL;
+        g_lblDest = NULL;
+        g_btnDestA = NULL;
+        g_btnDestB = NULL;
+        g_btnRemove = NULL;
+        g_btnAutoBalance = NULL;
+        g_btnBalanceSkill = NULL;
+        g_btnBalanceRating = NULL;
+        g_btnClearTeams = NULL;
+        g_btnRecruitment = NULL;
+        g_btnSwapTeams = NULL;
+        g_previewImage = NULL;
+        g_previewName = NULL;
+        g_previewMeta = NULL;
+        g_previewStats = NULL;
+        g_summary = NULL;
+        g_startButton = NULL;
+        g_stopButton = NULL;
+        g_status = NULL;
+        g_rosterDrawerButton = NULL;
+        g_settingsDrawerButton = NULL;
+        g_metrics = NULL;
+        for (int i = 0; i < 3; ++i)
+        {
+            g_columns[i] = NULL; g_columnContent[i] = NULL; g_presetButtons[i] = NULL;
+        }
+        g_buttonPresentation.clear();
+        g_viewSize = MyGUI::IntSize();
+        g_rosterRows.clear(); g_teamARows.clear(); g_teamBRows.clear(); g_poolRows.clear();
+        g_dragCharacter = NULL;
+        g_rowDragActive = false;
     }
 
     void CreatePanel()
     {
-        if (g_window)
-            return;
-
+        if (g_window) return;
         MyGUI::Gui* guiInstance = MyGUI::Gui::getInstancePtr();
-        if (!guiInstance)
+        if (!guiInstance) return;
+        try
         {
-            ErrorLog("Proving Grounds: MyGUI not ready");
-            return;
-        }
-
-        g_window = guiInstance->createWidgetReal<MyGUI::Window>(
-            "Kenshi_WindowCX", 0.06f, 0.05f, 0.88f, 0.82f,
-            MyGUI::Align::Center, "Window", "ProvingGroundsArenaWindow");
-        g_window->setCaption("Proving Grounds — Arena");
-        g_window->setVisible(false);
-        g_window->eventWindowButtonPressed += MyGUI::newDelegate(OnWindowButtonPressed);
-        TintWidget(g_window, kBgDark);
-
-        InstallArenaTopBar(g_window);
-
-        MyGUI::Widget* client = g_window->getClientWidget();
-
-        // Custom metal panel art — full client, behind all controls.
-        // Must live under gui/images so Kenshi puts it in MyGUI's GUI resource group
-        // (same pattern as Character Inspector's gui/silhouette).
-        g_arenaBg = client->createWidgetReal<MyGUI::ImageBox>(
-            "ImageBox", 0.0f, 0.0f, 1.0f, 1.0f, MyGUI::Align::Default, "PG_ArenaBg");
-        ApplyGuiTexture(g_arenaBg, kArenaBgTexture);
-
-        // Stable 25 / 50 / 25 composition aligned to the texture's metal frame.
-        g_titleEyebrow = NULL;
-        g_titleHero = MakeLabel(
-            client, 0.28f, 0.018f, 0.42f, 0.045f, "PG_Hero", "Arena Setup");
-        g_titleHero->setFontHeight(20);
-        g_titleHero->setTextAlign(MyGUI::Align::Center);
-        TintWidget(g_titleHero, kTextPrimary);
-
-        MyGUI::TextBox* rosterHeading = MakeLabel(
-            client, 0.05f, 0.055f, 0.13f, 0.04f, "PG_LblRoster", "Squad Roster");
-        rosterHeading->setFontHeight(19);
-        g_rosterCount = MakeLabel(
-            client, 0.175f, 0.059f, 0.075f, 0.035f, "PG_RosterCount", "0 fighters");
-        TintWidget(g_rosterCount, kMuted);
-        MyGUI::TextBox* searchLabel = NULL;
-        g_rosterSearchSurface = MakeSurface(
-            client, 0.05f, 0.103f, 0.20f, 0.052f, "PG_RosterSearchSurface");
-        TintWidget(g_rosterSearchSurface, kMuted);
-        if (::gui)
-        {
-            g_rosterSearch = ::gui->createEditBox(
-                client,
-                0.103f,
-                0.05f,
-                0.20f,
-                0.052f,
-                "PG_RosterSearch",
-                false);
-        }
-        else
-        {
-            g_rosterSearch = client->createWidgetReal<MyGUI::EditBox>(
-                "EditBox", 0.05f, 0.103f, 0.20f, 0.052f,
-                MyGUI::Align::Default, "PG_RosterSearch");
-        }
-        if (!g_rosterSearch)
-        {
-            ErrorLog("Proving Grounds: failed to create roster search edit box");
-            return;
-        }
-        g_rosterSearch->setFontHeight(16);
-        g_rosterSearch->setMaxTextLength(40);
-        g_rosterSearch->setEditReadOnly(false);
-        g_rosterSearch->setNeedMouseFocus(true);
-        g_rosterSearch->setNeedKeyFocus(true);
-        g_rosterSearch->setVisibleHScroll(false);
-        g_rosterSearch->setVisibleVScroll(false);
-        g_rosterSearch->setTextAlign(MyGUI::Align::VCenter | MyGUI::Align::Left);
-        g_rosterSearch->setOnlyText("Search fighters...");
-        g_rosterSearch->setTextColour(kMuted);
-        g_rosterSearch->eventEditTextChange += MyGUI::newDelegate(OnRosterSearchChanged);
-        g_rosterSearch->eventKeySetFocus += MyGUI::newDelegate(OnRosterSearchFocus);
-        g_rosterSearch->eventKeyLostFocus += MyGUI::newDelegate(OnRosterSearchBlur);
-        g_rosterSearch->eventMouseButtonPressed +=
-            MyGUI::newDelegate(OnRosterSearchMousePressed);
-        g_rosterSearch->eventEditSelectAccept +=
-            MyGUI::newDelegate(OnRosterSearchAccepted);
-
-        g_filterAll = MakeButton(
-            client, 0.05f, 0.165f, 0.06f, 0.045f, "PG_FilterAll", "All", OnFilterAll);
-        g_filterReady = MakeButton(
-            client, 0.115f, 0.165f, 0.06f, 0.045f, "PG_FilterReady", "Ready", OnFilterReady);
-        g_filterAssigned = MakeButton(
-            client, 0.18f, 0.165f, 0.07f, 0.045f,
-            "PG_FilterAssigned", "Assigned", OnFilterAssigned);
-        g_filterUnavailable = NULL;
-        g_filterAll->setFontHeight(14);
-        g_filterReady->setFontHeight(14);
-        g_filterAssigned->setFontHeight(13);
-        MyGUI::TextBox* lblRosterHint = MakeLabel(
-            client, 0.05f, 0.218f, 0.20f, 0.035f, "PG_RosterHint",
-            "Assign: double-click/drag | Remove: right-click");
-        TintWidget(lblRosterHint, kMuted);
-        g_rosterScroll = MakeScroll(client, 0.05f, 0.258f, 0.174f, 0.652f, "PG_Roster");
-        g_rosterScrollUp = MakeButton(
-            client, 0.226f, 0.265f, 0.022f, 0.05f,
-            "PG_RosterScrollUp", "^", OnScrollButton);
-        g_rosterScrollDown = MakeButton(
-            client, 0.226f, 0.852f, 0.022f, 0.05f,
-            "PG_RosterScrollDown", "v", OnScrollButton);
-        g_rosterScrollUp->setUserString("scroll", "0:1");
-        g_rosterScrollDown->setUserString("scroll", "0:-1");
-
-        MyGUI::TextBox* modeHeading = MakeLabel(
-            client, 0.28f, 0.075f, 0.42f, 0.04f, "PG_LblMode", "Match Mode");
-        modeHeading->setFontHeight(19);
-        g_modeAvB = MakeButton(
-            client, 0.28f, 0.118f, 0.135f, 0.058f, "PG_ModeAvB", "Teams", OnModeAvB);
-        g_modeTeams1v1 = MakeButton(
-            client, 0.42f, 0.118f, 0.13f, 0.058f, "PG_ModeTeams1v1", "Teams 1v1", OnModeTeams1v1);
-        g_modeLast = MakeButton(
-            client, 0.555f, 0.118f, 0.145f, 0.058f, "PG_ModeLast", "Last Man Standing", OnModeLast);
-
-        g_lblDest = MakeLabel(
-            client, 0.28f, 0.188f, 0.42f, 0.032f, "PG_LblDest",
-            "Double-click assigns to Team A");
-        TintWidget(g_lblDest, kTeamA);
-        g_btnDestA = MakeButton(
-            client, 0.28f, 0.195f, 0.205f, 0.055f,
-            "PG_DestA", "Assign to Team A", OnDestA);
-        g_btnDestB = MakeButton(
-            client, 0.495f, 0.195f, 0.205f, 0.055f,
-            "PG_DestB", "Assign to Team B", OnDestB);
-
-        g_lblTeamA = MakeLabel(
-            client, 0.28f, 0.262f, 0.205f, 0.04f, "PG_LblTeamA", "Team A | 0 fighters | ~0 combat");
-        TintWidget(g_lblTeamA, kTeamA);
-        g_lblTeamB = MakeLabel(
-            client, 0.495f, 0.262f, 0.205f, 0.04f, "PG_LblTeamB", "Team B | 0 fighters | ~0 combat");
-        TintWidget(g_lblTeamB, kTeamB);
-        g_teamASurface = MakeSurface(
-            client, 0.28f, 0.304f, 0.205f, 0.438f, "PG_TeamASurface");
-        g_teamBSurface = MakeSurface(
-            client, 0.495f, 0.304f, 0.205f, 0.438f, "PG_TeamBSurface");
-        g_teamAScroll = MakeScroll(client, 0.282f, 0.308f, 0.175f, 0.430f, "PG_TeamA");
-        g_teamBScroll = MakeScroll(client, 0.497f, 0.308f, 0.175f, 0.430f, "PG_TeamB");
-        g_teamAScrollUp = MakeButton(
-            client, 0.459f, 0.315f, 0.022f, 0.05f,
-            "PG_TeamAScrollUp", "^", OnScrollButton);
-        g_teamAScrollDown = MakeButton(
-            client, 0.459f, 0.681f, 0.022f, 0.05f,
-            "PG_TeamAScrollDown", "v", OnScrollButton);
-        g_teamBScrollUp = MakeButton(
-            client, 0.674f, 0.315f, 0.022f, 0.05f,
-            "PG_TeamBScrollUp", "^", OnScrollButton);
-        g_teamBScrollDown = MakeButton(
-            client, 0.674f, 0.681f, 0.022f, 0.05f,
-            "PG_TeamBScrollDown", "v", OnScrollButton);
-        g_teamAScrollUp->setUserString("scroll", "1:1");
-        g_teamAScrollDown->setUserString("scroll", "1:-1");
-        g_teamBScrollUp->setUserString("scroll", "2:1");
-        g_teamBScrollDown->setUserString("scroll", "2:-1");
-        TintWidget(g_teamAScroll, kTeamA);
-        TintWidget(g_teamBScroll, kTeamB);
-        ResetDropZoneVisuals();
-
-        g_lblPool = MakeLabel(
-            client, 0.28f, 0.262f, 0.42f, 0.04f, "PG_LblPool", "Fighter pool  |  0 fighters");
-        g_poolSurface = MakeSurface(
-            client, 0.28f, 0.304f, 0.42f, 0.438f, "PG_PoolSurface");
-        g_poolScroll = MakeScroll(client, 0.282f, 0.308f, 0.390f, 0.430f, "PG_Pool");
-        g_poolScrollUp = MakeButton(
-            client, 0.674f, 0.315f, 0.022f, 0.05f,
-            "PG_PoolScrollUp", "^", OnScrollButton);
-        g_poolScrollDown = MakeButton(
-            client, 0.674f, 0.681f, 0.022f, 0.05f,
-            "PG_PoolScrollDown", "v", OnScrollButton);
-        g_poolScrollUp->setUserString("scroll", "3:1");
-        g_poolScrollDown->setUserString("scroll", "3:-1");
-        TintWidget(g_poolSurface, kReady);
-
-        g_btnAutoBalance = MakeButton(
-            client, 0.28f, 0.76f, 0.135f, 0.055f,
-            "PG_AutoBalance", "Balance", OnBalanceMenu);
-        g_btnBalanceSkill = MakeButton(
-            client, 0.42f, 0.76f, 0.13f, 0.055f,
-            "PG_BalanceSkill", "By Skill", OnBalanceBySkill);
-        g_btnBalanceRating = MakeButton(
-            client, 0.555f, 0.76f, 0.145f, 0.055f,
-            "PG_BalanceRating", "By Rating", OnBalanceByRating);
-        g_btnBalanceSkill->setVisible(false);
-        g_btnBalanceRating->setVisible(false);
-        g_btnSwapTeams = MakeButton(
-            client, 0.42f, 0.76f, 0.13f, 0.055f,
-            "PG_SwapTeams", "Swap Teams", OnSwapTeams);
-        g_btnClearTeams = MakeButton(
-            client, 0.555f, 0.76f, 0.145f, 0.055f,
-            "PG_ClearTeams", "Clear Teams", OnClearTeams);
-        TintWidget(g_btnClearTeams, kDanger);
-        g_btnRemove = MakeButton(
-            client, 0.74f, 0.282f, 0.20f, 0.05f,
-            "PG_Remove", "Remove Fighter", OnRemove);
-        TintWidget(g_btnRemove, kDanger);
-        MyGUI::TextBox* builderHint = MakeLabel(
-            client, 0.28f, 0.825f, 0.42f, 0.032f, "PG_BuilderHint",
-            "Presets: left-click load | right-click save");
-        TintWidget(builderHint, kMuted);
-        for (int i = 0; i < 3; ++i)
-        {
-            char name[32];
-            char caption[32];
-            sprintf_s(name, "PG_Preset%d", i + 1);
-            sprintf_s(caption, "Preset %d", i + 1);
-            g_presetButtons[i] = MakeButton(
-                client,
-                0.28f + (static_cast<float>(i) * 0.1425f),
-                0.862f,
-                0.135f,
-                0.045f,
-                name,
-                caption,
-                OnPresetButtonClick);
-            g_presetButtons[i]->setUserString("preset", i == 0 ? "0" : (i == 1 ? "1" : "2"));
-            g_presetButtons[i]->eventMouseButtonPressed +=
-                MyGUI::newDelegate(OnPresetMousePressed);
-        }
-        RefreshPresetButtons();
-
-        MyGUI::TextBox* selectedHeading = MakeLabel(
-            client, 0.74f, 0.075f, 0.20f, 0.04f, "PG_LblPreview", "Selected Fighter");
-        selectedHeading->setFontHeight(19);
-        g_previewImage = client->createWidgetReal<MyGUI::ImageBox>(
-            "ImageBox", 0.74f, 0.12f, 0.065f, 0.10f, MyGUI::Align::Default, "PG_PreviewImg");
-        if (g_previewImage)
+            g_window = guiInstance->createWidgetReal<MyGUI::Window>("Kenshi_WindowCX",
+                .04f, .04f, .92f, .92f, MyGUI::Align::Center, "Window", "ProvingGroundsArenaWindow");
+            g_window->setCaption("Proving Grounds - Arena");
+            g_window->setVisible(false);
+            g_window->eventWindowButtonPressed += MyGUI::newDelegate(OnWindowButtonPressed);
+            MyGUI::Widget* client = g_window->getClientWidget();
+            g_metrics = NativeUI::Label(client, MyGUI::IntCoord(0, 0, 100, 24), "PG_Metrics", "Arena");
+            g_metrics->setVisible(false);
+            for (int i = 0; i < 3; ++i)
+            {
+                char name[32]; sprintf_s(name, "PG_Column%d", i);
+                g_columns[i] = NativeUI::Scroll(client, MyGUI::IntCoord(0, 0, 300, 300), name);
+                g_columnContent[i] = g_columns[i]->createWidget<MyGUI::Widget>("PanelEmpty",
+                    MyGUI::IntCoord(0, 0, 300, 300), MyGUI::Align::Default);
+            }
+            MyGUI::Widget* roster = g_columnContent[0];
+            MyGUI::Widget* builder = g_columnContent[1];
+            MyGUI::Widget* settings = g_columnContent[2];
+            g_titleHero = PanelLabel(client, "PG_Hero", "Arena Setup");
+            g_btnRecruitment = PanelButton(client, "PG_PrisonerRecruitment",
+                "Recruit Prisoners", OnRecruitPrisoners);
+            PanelLabel(roster, "PG_LblRoster", "Squad Roster");
+            g_rosterCount = PanelLabel(roster, "PG_RosterCount", "0 fighters");
+            g_rosterSearch = roster->createWidget<MyGUI::EditBox>("Kenshi_EditBox",
+                MyGUI::IntCoord(0, 0, 200, 32), MyGUI::Align::Default, "PG_RosterSearch");
+            g_rosterSearch->setMaxTextLength(40);
+            g_rosterSearch->setEditReadOnly(false);
+            g_rosterSearch->setOnlyText("Search fighters...");
+            g_rosterSearch->eventEditTextChange += MyGUI::newDelegate(OnRosterSearchChanged);
+            g_rosterSearch->eventKeySetFocus += MyGUI::newDelegate(OnRosterSearchFocus);
+            g_rosterSearch->eventKeyLostFocus += MyGUI::newDelegate(OnRosterSearchBlur);
+            g_rosterSearch->eventMouseButtonPressed += MyGUI::newDelegate(OnRosterSearchMousePressed);
+            g_rosterSearch->eventEditSelectAccept += MyGUI::newDelegate(OnRosterSearchAccepted);
+            PanelLabel(roster, "PG_RosterHint", "Double-click or drag to assign. Right-click to remove.");
+            g_rosterScroll = NativeUI::Scroll(roster, MyGUI::IntCoord(0, 0, 200, 300), "PG_Roster");
+            PanelLabel(builder, "PG_LblMode", "Match Mode");
+            g_modeAvB = PanelButton(builder, "PG_ModeAvB", "Teams", OnModeAvB);
+            g_modeTeams1v1 = PanelButton(builder, "PG_ModeTeams1v1", "Teams 1v1", OnModeTeams1v1);
+            g_modeLast = PanelButton(builder, "PG_ModeLast", "Last Man Standing", OnModeLast);
+            g_lblDest = PanelLabel(builder, "PG_LblDest", "Double-click assigns to Team A");
+            g_btnDestA = PanelButton(builder, "PG_DestA", "Assign to Team A", OnDestA);
+            g_btnDestB = PanelButton(builder, "PG_DestB", "Assign to Team B", OnDestB);
+            g_lblTeamA = PanelLabel(builder, "PG_LblTeamA", "Team A");
+            g_lblTeamB = PanelLabel(builder, "PG_LblTeamB", "Team B");
+            g_lblPool = PanelLabel(builder, "PG_LblPool", "Fighter pool");
+            g_teamAScroll = NativeUI::Scroll(builder, MyGUI::IntCoord(0, 0, 200, 300), "PG_TeamA");
+            g_teamBScroll = NativeUI::Scroll(builder, MyGUI::IntCoord(0, 0, 200, 300), "PG_TeamB");
+            g_poolScroll = NativeUI::Scroll(builder, MyGUI::IntCoord(0, 0, 200, 300), "PG_Pool");
+            g_btnAutoBalance = PanelButton(builder, "PG_AutoBalance", "Balance", OnBalanceMenu);
+            g_btnBalanceSkill = PanelButton(builder, "PG_BalanceSkill", "By Skill", OnBalanceBySkill);
+            g_btnBalanceRating = PanelButton(builder, "PG_BalanceRating", "By Rating", OnBalanceByRating);
+            g_btnSwapTeams = PanelButton(builder, "PG_SwapTeams", "Swap Teams", OnSwapTeams);
+            g_btnClearTeams = PanelButton(builder, "PG_ClearTeams", "Clear Teams", OnClearTeams);
+            PanelLabel(builder, "PG_BuilderHint", "Presets: left-click to load, right-click to save.");
+            for (int i = 0; i < 3; ++i)
+            {
+                char name[32], caption[32], index[4];
+                sprintf_s(name, "PG_Preset%d", i + 1); sprintf_s(caption, "Preset %d", i + 1); sprintf_s(index, "%d", i);
+                g_presetButtons[i] = PanelButton(builder, name, caption, OnPresetButtonClick);
+                g_presetButtons[i]->setUserString("preset", index);
+                g_presetButtons[i]->eventMouseButtonPressed += MyGUI::newDelegate(OnPresetMousePressed);
+            }
+            PanelLabel(settings, "PG_LblPreview", "Selected Fighter");
+            g_previewImage = settings->createWidget<MyGUI::ImageBox>("ImageBox",
+                MyGUI::IntCoord(0, 0, kPortraitSize, kPortraitSize), MyGUI::Align::Default, "PG_PreviewImg");
             g_previewImage->setVisible(false);
-        g_previewName = MakeLabel(
-            client, 0.815f, 0.12f, 0.125f, 0.045f,
-            "PG_PreviewName", "No fighter selected");
-        g_previewName->setFontHeight(18);
-        TintWidget(g_previewName, kBrass);
-        g_previewMeta = MakeLabel(
-            client, 0.815f, 0.167f, 0.125f, 0.04f,
-            "PG_PreviewMeta", "Select a roster or team row");
-        TintWidget(g_previewMeta, kMuted);
-        g_previewStats = MakeLabel(
-            client, 0.74f, 0.225f, 0.20f, 0.055f,
-            "PG_PreviewStats", "Choose a fighter to review readiness.");
-        g_previewStats->setFontHeight(14);
-        TintWidget(g_previewStats, kTextPrimary);
-
-        MyGUI::TextBox* settingsHeading = MakeLabel(
-            client, 0.74f, 0.335f, 0.20f, 0.04f, "PG_LblSettings", "Match Settings");
-        settingsHeading->setFontHeight(19);
-        MyGUI::TextBox* locationLabel = MakeLabel(
-            client, 0.74f, 0.378f, 0.20f, 0.027f, "PG_LblLoc", "LOCATION");
-        g_locArena = MakeButton(
-            client, 0.74f, 0.408f, 0.097f, 0.052f, "PG_LocArena", "Arena", OnLocationArena);
-        g_locBanner = MakeButton(
-            client, 0.843f, 0.408f, 0.097f, 0.052f, "PG_LocBanner", "Banner", OnLocationBanner);
-        g_koEliminationButton = MakeButton(
-            client, 0.74f, 0.478f, 0.20f, 0.052f,
-            "PG_KoElimination", "KO Elimination: OFF", OnKoEliminationToggle);
-
-        MyGUI::TextBox* summaryHeading = MakeLabel(
-            client, 0.74f, 0.548f, 0.20f, 0.035f, "PG_LblSummary", "Match Summary");
-        g_summary = MakeLabel(
-            client, 0.74f, 0.586f, 0.20f, 0.115f, "PG_Summary", "Team A vs Team B");
-        TintWidget(g_summary, kTextPrimary);
-
-        g_status = MakeLabel(
-            client, 0.74f, 0.735f, 0.20f, 0.07f,
-            "PG_Status", "Assign at least one fighter to each team.");
-        TintWidget(g_status, kDanger);
-        g_startButton = MakeButton(
-            client, 0.74f, 0.82f, 0.20f, 0.075f, "PG_Start", "Start Match", OnStart);
-        g_startButton->setFontHeight(18);
-        TintWidget(g_startButton, kAmber);
-        g_stopButton = MakeButton(
-            client, 0.74f, 0.82f, 0.20f, 0.075f, "PG_Stop", "Stop Spar", OnStop);
-        g_stopButton->setFontHeight(18);
-        TintWidget(g_stopButton, kDanger);
-
-        // Narrow-aspect access: side columns collapse into explicit drawers.
-        g_rosterDrawerButton = MakeButton(
-            client, 0.05f, 0.018f, 0.14f, 0.052f,
-            "PG_RosterDrawer", "Squad Roster", OnToggleRosterDrawer);
-        g_settingsDrawerButton = MakeButton(
-            client, 0.80f, 0.018f, 0.14f, 0.052f,
-            "PG_SettingsDrawer", "Match Settings", OnToggleSettingsDrawer);
-        g_rosterDrawerButton->setVisible(false);
-        g_settingsDrawerButton->setVisible(false);
-
-        g_rosterColumnWidgets.clear();
-        g_rosterColumnWidgets.push_back(rosterHeading);
-        g_rosterColumnWidgets.push_back(g_rosterCount);
-        g_rosterColumnWidgets.push_back(searchLabel);
-        g_rosterColumnWidgets.push_back(g_rosterSearchSurface);
-        g_rosterColumnWidgets.push_back(g_rosterSearch);
-        g_rosterColumnWidgets.push_back(g_filterAll);
-        g_rosterColumnWidgets.push_back(g_filterReady);
-        g_rosterColumnWidgets.push_back(g_filterAssigned);
-        g_rosterColumnWidgets.push_back(g_filterUnavailable);
-        g_rosterColumnWidgets.push_back(lblRosterHint);
-        g_rosterColumnWidgets.push_back(g_rosterScroll);
-        g_rosterColumnWidgets.push_back(g_rosterScrollUp);
-        g_rosterColumnWidgets.push_back(g_rosterScrollDown);
-
-        g_settingsColumnWidgets.clear();
-        g_settingsColumnWidgets.push_back(selectedHeading);
-        g_settingsColumnWidgets.push_back(g_previewImage);
-        g_settingsColumnWidgets.push_back(g_previewName);
-        g_settingsColumnWidgets.push_back(g_previewMeta);
-        g_settingsColumnWidgets.push_back(g_previewStats);
-        g_settingsColumnWidgets.push_back(g_btnRemove);
-        g_settingsColumnWidgets.push_back(settingsHeading);
-        g_settingsColumnWidgets.push_back(locationLabel);
-        g_settingsColumnWidgets.push_back(g_locArena);
-        g_settingsColumnWidgets.push_back(g_locBanner);
-        g_settingsColumnWidgets.push_back(g_koEliminationButton);
-        g_settingsColumnWidgets.push_back(summaryHeading);
-        g_settingsColumnWidgets.push_back(g_summary);
-        g_settingsColumnWidgets.push_back(g_status);
-        g_settingsColumnWidgets.push_back(g_startButton);
-        g_settingsColumnWidgets.push_back(g_stopButton);
-
-        UpdateModeVisibility();
-        UpdateLocationHighlight();
-        UpdateRosterFilterHighlight();
-        RefreshAll();
-        RefreshResponsiveMode();
-        DebugLog("Proving Grounds: Arena UI created with custom background");
+            g_previewName = PanelLabel(settings, "PG_PreviewName", "No fighter selected");
+            g_previewMeta = PanelLabel(settings, "PG_PreviewMeta", "Select a roster or team row");
+            g_previewStats = PanelLabel(settings, "PG_PreviewStats", "Choose a fighter to review readiness.");
+            g_btnRemove = PanelButton(settings, "PG_Remove", "Remove Fighter", OnRemove);
+            PanelLabel(settings, "PG_LblSettings", "Match Settings");
+            PanelLabel(settings, "PG_LblLoc", "Location");
+            g_locArena = PanelButton(settings, "PG_LocArena", "Arena", OnLocationArena);
+            g_locSmallArena = PanelButton(settings, "PG_LocSmallArena", "Small", OnLocationSmallArena);
+            g_locBanner = PanelButton(settings, "PG_LocBanner", "Banner", OnLocationBanner);
+            g_medicalProtocolButton = PanelButton(settings, "PG_MedicalProtocol", "Medical: Ringside Aid", OnMedicalProtocolToggle);
+            BindSettingsToolTip(g_medicalProtocolButton);
+            PanelLabel(settings, "PG_LblSummary", "Match Summary");
+            g_summary = PanelLabel(settings, "PG_Summary", "Team A vs Team B");
+            g_status = client->createWidget<MyGUI::EditBox>("Kenshi_WordWrap",
+                MyGUI::IntCoord(0, 0, 200, 80), MyGUI::Align::Default, "PG_Status");
+            g_startButton = PanelButton(client, "PG_Start", "Start Fight", OnStart);
+            g_stopButton = PanelButton(client, "PG_Stop", "Stop Fight", OnStop);
+            g_rosterDrawerButton = PanelButton(client, "PG_RosterDrawer", "Squad Roster", OnToggleRosterDrawer);
+            g_settingsDrawerButton = PanelButton(client, "PG_SettingsDrawer", "Match Settings", OnToggleSettingsDrawer);
+            g_settingsTip = client->createWidget<MyGUI::EditBox>("Kenshi_WordWrap",
+                MyGUI::IntCoord(0, 0, 280, 80), MyGUI::Align::Default, "PG_SettingsTip");
+            g_settingsTip->setVisible(false);
+            Passive(g_settingsTip);
+            g_layoutReady = true;
+            UpdateModeVisibility();
+            UpdateLocationHighlight();
+            UpdateMedicalProtocolButton();
+            RefreshPresetButtons();
+            RefreshResponsiveMode();
+            RefreshAll();
+            PGLog::Debug("Proving Grounds: native Arena UI created");
+        }
+        catch (...)
+        {
+            DestroyPanelWidgets();
+            PGLog::Error("Proving Grounds: failed to create native Arena UI");
+        }
     }
 
     void ShowWindow()
@@ -3294,11 +2929,9 @@ namespace
             CreatePanel();
         if (g_window)
         {
-            if (!g_arenaTop)
-                InstallArenaTopBar(g_window);
-            // Re-apply in case TitleScreen created the panel before GUI paths were ready.
-            ApplyArenaChrome();
+            RefreshResponsiveMode();
             g_window->setVisible(true);
+            ResetUiRefreshClock();
         }
     }
 
@@ -3306,14 +2939,16 @@ namespace
     {
         if (!g_window || !g_window->getVisible())
             return;
+        HideSettingsTip();
         g_window->setVisible(false);
+        ResetUiRefreshClock();
     }
 
     void TogglePanel()
     {
         if (g_window && g_window->getVisible())
         {
-            g_window->setVisible(false);
+            HidePanel();
             return;
         }
 
@@ -3331,18 +2966,11 @@ namespace
 
     void PollF8Toggle()
     {
-        if (!kF8OpensDebugMenu && !kF8OpensArenaUi)
-        {
-            g_f8WasDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-            return;
-        }
         const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        if (down && !g_f8WasDown)
+        if (down && !g_f8WasDown && PGConfig::F8OpensDebugMenu())
         {
-            if (kF8OpensDebugMenu)
-                DebugMenu::Toggle();
-            else if (kF8OpensArenaUi)
-                TogglePanel();
+            PGSettingsUI::Close();
+            DebugMenu::Toggle();
         }
         g_f8WasDown = down;
     }
@@ -3353,7 +2981,27 @@ namespace
         bool consumed = false;
         if (down && !g_escWasDown)
         {
-            if (DebugMenu::IsVisible())
+            if (TownBookie::IsVisible())
+            {
+                TownBookie::Close();
+                consumed = true;
+            }
+            else if (TownArenaUI::IsVisible())
+            {
+                TownArenaUI::Close();
+                consumed = true;
+            }
+            else if (PrisonerRecruitmentUI::IsVisible())
+            {
+                PrisonerRecruitmentUI::Close();
+                consumed = true;
+            }
+            else if (PGSettingsUI::IsVisible())
+            {
+                PGSettingsUI::Close();
+                consumed = true;
+            }
+            else if (DebugMenu::IsVisible())
             {
                 DebugMenu::Close();
                 consumed = true;
@@ -3361,6 +3009,11 @@ namespace
             else if (LeaderboardUI::IsVisible())
             {
                 LeaderboardUI::Close();
+                consumed = true;
+            }
+            else if (RewardsUI::IsVisible())
+            {
+                RewardsUI::Close();
                 consumed = true;
             }
             else if (ResultsUI::IsVisible())
@@ -3395,9 +3048,7 @@ namespace
     {
         if (!scroll)
             return MyGUI::IntPoint();
-        const ListKind kind = ListKindForScroll(scroll);
-        return MyGUI::IntPoint(
-            0, g_listScrollOffset[static_cast<int>(kind)]);
+        return scroll->getViewOffset();
     }
 
     bool SamePoint(const MyGUI::IntPoint& a, const MyGUI::IntPoint& b)
@@ -3461,9 +3112,27 @@ namespace
             UpdateScrollButtonsForKind(ListPool);
     }
 
+    void RouteColumnWheelFallback(int wheel, const MyGUI::IntPoint* before)
+    {
+        if (!wheel || !g_window || !g_window->getVisible()) return;
+        const MyGUI::IntPoint mouse = MyGUI::InputManager::getInstance().getMousePositionByLayer();
+        MyGUI::ScrollView* lists[] = {g_rosterScroll, g_teamAScroll, g_teamBScroll, g_poolScroll};
+        for (int i = 0; i < 4; ++i)
+            if (PointInside(lists[i], mouse)) return;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!PointInside(g_columns[i], mouse)) continue;
+            if (SamePoint(before[i], g_columns[i]->getViewOffset()))
+                ScrollListBy(g_columns[i], wheel < 0 ? -NativeUI::RowHeight(g_metrics, 0) * 2 : NativeUI::RowHeight(g_metrics, 0) * 2);
+            break;
+        }
+    }
+
     void ForgottenGUI_update_hook(ForgottenGUI* thisptr)
     {
         const int wheel = key ? key->mWheel : 0;
+        MyGUI::IntPoint columnsBefore[3];
+        for (int i = 0; i < 3; ++i) columnsBefore[i] = ScrollOffset(g_columns[i]);
         const MyGUI::IntPoint rosterBefore = ScrollOffset(g_rosterScroll);
         const MyGUI::IntPoint teamABefore = ScrollOffset(g_teamAScroll);
         const MyGUI::IntPoint teamBBefore = ScrollOffset(g_teamBScroll);
@@ -3478,41 +3147,147 @@ namespace
         }
         RouteArenaWheelFallback(
             wheel, rosterBefore, teamABefore, teamBBefore, poolBefore);
+        RouteColumnWheelFallback(wheel, columnsBefore);
+        ContextMenuHooks::Tick(thisptr);
         ContextMenuHooks::RefreshArenaCursor(thisptr);
         PollF8Toggle();
+        DebugMenu::Tick();
         ArenaIngress::Tick();
-        PrisonerUtil::ProtectMatchPrisoners();
+        PrisonerUtil::TickMatchUpkeep();
         PrisonerUtil::TickReturn();
+        WorldLifecycle::Tick();
         KOWatcher::Tick();
+        TownArena::Tick();
+        // Both arenas run the same session, so the guard is ticked once here rather
+        // than by either of them -- it serves the town bout and the player-run ones.
+        ArenaRingGuard::Tick();
+        TownArenaUI::Tick();
+        MarksHUD::Tick(thisptr);
+        TownBookie::Tick();
+        PrisonerUtil::TickRingsideAid();
         ResultsUI::Tick();
         LeaderboardUI::Tick();
+        RewardsUI::Tick();
+        PrisonerRecruitmentUI::Tick();
         if (g_window && g_window->getVisible())
         {
-            RefreshResponsiveMode();
-            RefreshStatusAndButtons();
-            RefreshPointerHighlights();
+            const bool refreshIdleUi = FrameCadencePolicy::Advance(
+                g_uiRefreshElapsedSec,
+                AdvanceUiRefreshClock(),
+                kIdleUiRefreshIntervalSec);
+            if (refreshIdleUi)
+            {
+                RefreshResponsiveMode();
+                RefreshStatusAndButtons();
+            }
+            if (g_rowDragActive || refreshIdleUi)
+                RefreshPointerHighlights();
         }
+    }
+
+    void OptionsWindow_update_hook(OptionsWindow* thisptr)
+    {
+        OptionsWindow_update_orig(thisptr);
+        PGSettingsUI::InjectModsTabUI(thisptr);
     }
 }
 
 namespace ArenaUI
 {
-    void ShowFromRegistry(RootObject* registry)
+    void AbandonWorldState()
     {
+        MarksHUD::AbandonWorldState();
+        TownArenaUI::AbandonWorldState();
+        RewardsUI::AbandonWorldState();
+        PrisonerRecruitmentUI::AbandonWorldState();
+        g_squadCache.clear();
+        g_rosterCache.clear();
+        g_filteredRoster.clear();
+        g_teamA.clear();
+        g_teamB.clear();
+        g_pool.clear();
+        g_rosterRows.clear();
+        g_teamARows.clear();
+        g_teamBRows.clear();
+        g_poolRows.clear();
+        g_handlerAssignments.clear();
+
+        for (int i = 0; i < 3; ++i)
+        {
+            g_setupPresets[i].valid = false;
+            g_setupPresets[i].teamA.clear();
+            g_setupPresets[i].teamB.clear();
+            g_setupPresets[i].pool.clear();
+        }
+        if (g_window)
+        {
+            MyGUI::ScrollView* lists[] = {g_rosterScroll, g_teamAScroll, g_teamBScroll, g_poolScroll};
+            for (int i = 0; i < 4; ++i) if (lists[i]) lists[i]->setViewOffset(MyGUI::IntPoint());
+            for (int i = 0; i < 3; ++i) if (g_columns[i]) g_columns[i]->setViewOffset(MyGUI::IntPoint());
+        }
+
+        g_previewChar = NULL;
+        g_dragCharacter = NULL;
+        g_rowDragActive = false;
+        g_balanceMenuOpen = false;
+        g_rosterQuery.clear();
+        g_searchPlaceholderActive = true;
+        ResetUiRefreshClock();
+
+        // UI objects belong to MyGUI rather than the game world. Keep the panel
+        // allocated, but hide it until rows can be rebuilt from the new world.
+        if (MyGUI::Gui::getInstancePtr())
+        {
+            HideSettingsTip();
+            if (g_window)
+                g_window->setVisible(false);
+            if (g_previewImage)
+                g_previewImage->setVisible(false);
+            if (g_status)
+                g_status->setCaption("Idle");
+        }
+    }
+
+    void ShowFromRegistry(RootObject* registry, bool bindRegistry)
+    {
+        TownBookie::Close();
+        PrisonerRecruitmentUI::AbandonWorldState();
+        if (ArenaIdentity::IsTownRegistry(registry))
+        {
+            HidePanel();
+            TownArenaUI::Show(static_cast<Building*>(registry), bindRegistry);
+            return;
+        }
+        TownArenaUI::Close();
         if (ArenaIngress::IsPending())
         {
             ShowWindow();
             RefreshAll();
             if (g_status)
-                g_status->setCaption("Walk-in already in progress");
+                g_status->setCaption(ArenaIngress::GetStatus().c_str());
             return;
         }
 
-        ArenaIngress::BindRegistry(registry);
+        if (bindRegistry)
+            ArenaIngress::BindRegistry(registry);
         ShowWindow();
         RefreshAll();
+        Character* opener = ArenaIngress::GetUiOpener();
+        if (opener && opener->isValid() && VectorContains(g_rosterCache, opener))
+            SetPreview(opener);
         if (g_status)
-            g_status->setCaption(ArenaIngress::GetStatus().c_str());
+        {
+            g_status->setCaption(SparSession::IsActive()
+                ? SparSession::GetStatus().c_str()
+                : ArenaIngress::GetStatus().c_str());
+        }
+    }
+
+    Character* GetPreviewCharacter()
+    {
+        if (g_previewChar && g_previewChar->isValid())
+            return g_previewChar;
+        return NULL;
     }
 
     bool InstallHooks()
@@ -3522,7 +3297,7 @@ namespace ArenaUI
                 TitleScreen_hook,
                 &TitleScreen_orig))
         {
-            ErrorLog("Proving Grounds: failed to hook TitleScreen constructor");
+            PGLog::Error("Proving Grounds: failed to hook TitleScreen constructor");
             return false;
         }
 
@@ -3531,11 +3306,20 @@ namespace ArenaUI
                 ForgottenGUI_update_hook,
                 &ForgottenGUI_update_orig))
         {
-            ErrorLog("Proving Grounds: failed to hook ForgottenGUI::update");
+            PGLog::Error("Proving Grounds: failed to hook ForgottenGUI::update");
             return false;
         }
 
-        DebugLog("Proving Grounds: ArenaUI hooks installed");
+        if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+                KenshiLib::GetRealAddress(&OptionsWindow::_NV_update),
+                OptionsWindow_update_hook,
+                &OptionsWindow_update_orig))
+        {
+            PGLog::Error("Proving Grounds: failed to hook OptionsWindow::_NV_update for Mods settings");
+            return false;
+        }
+
+        PGLog::Debug("Proving Grounds: ArenaUI hooks installed");
         return true;
     }
 }

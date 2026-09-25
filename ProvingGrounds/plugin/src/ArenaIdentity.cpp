@@ -1,6 +1,7 @@
 #include "ArenaIdentity.h"
+#include "TownArenaRuntimePolicy.h"
 
-#include <Debug.h>
+#include "PGLog.h"
 #include <string>
 
 #pragma warning(push)
@@ -21,10 +22,13 @@ namespace ArenaIdentity
     const char* kRegistryStringId = "45-Proving Grounds.mod";
     const char* kRegistryFunctionStringId = "47-Proving Grounds.mod";
     const char* kArenaStringId = "36-Proving Grounds.mod";
+    const char* kSmallArenaStringId = "334-Proving Grounds.mod";
     const char* kBannerStringId = "42-Proving Grounds.mod";
     const char* kBannerFunctionStringId = "60-Proving Grounds.mod";
     const char* kLeaderboardStringId = "53-Proving Grounds.mod";
     const char* kLeaderboardFunctionStringId = "57-Proving Grounds.mod";
+    const char* kTownLeaderboardStringId = "272-Proving Grounds.mod";
+    const char* kTownLeaderboardFunctionStringId = "273-Proving Grounds.mod";
 
     namespace
     {
@@ -33,10 +37,15 @@ namespace ArenaIdentity
             return data && id && data->stringID == id;
         }
 
-        bool IsLeaderboardData(GameData* data)
+        bool GetLeaderboardDataKind(
+            GameData* data,
+            LeaderboardData::Kind& kind)
         {
-            return IdEquals(data, kLeaderboardStringId)
-                || IdEquals(data, kLeaderboardFunctionStringId);
+            if (!data || !LeaderboardData::IsLeaderboardId(
+                    data->stringID.c_str()))
+                return false;
+            kind = LeaderboardData::KindForId(data->stringID.c_str());
+            return true;
         }
 
         bool IsRegistryData(GameData* data)
@@ -97,6 +106,7 @@ namespace ArenaIdentity
 
     bool IsRegistry(RootObject* obj)
     {
+        if (IsTownRegistry(obj)) return true;
         if (!obj)
             return false;
         if (IsRegistryData(obj->getGameData()))
@@ -113,7 +123,16 @@ namespace ArenaIdentity
         return false;
     }
 
-    bool IsArena(RootObject* obj) { return MatchesId(obj, kArenaStringId); }
+    bool IsArena(RootObject* obj)
+    {
+        return MatchesId(obj, kArenaStringId) ||
+            (obj && TownArenaRuntimePolicy::IsNewArena(GetStringId(obj)));
+    }
+    bool IsTownRegistry(RootObject* obj)
+    {
+        return obj && TownArenaRuntimePolicy::IsTownRegistry(GetStringId(obj));
+    }
+    bool IsSmallArena(RootObject* obj) { return MatchesId(obj, kSmallArenaStringId); }
     bool IsBanner(RootObject* obj)
     {
         if (!obj)
@@ -137,18 +156,27 @@ namespace ArenaIdentity
 
     bool IsLeaderboard(RootObject* obj)
     {
+        LeaderboardData::Kind kind = LeaderboardData::Player;
+        return GetLeaderboardKind(obj, kind);
+    }
+
+    bool GetLeaderboardKind(
+        RootObject* obj,
+        LeaderboardData::Kind& kind)
+    {
         if (!obj)
             return false;
-        if (IsLeaderboardData(obj->getGameData()))
+        if (GetLeaderboardDataKind(obj->getGameData(), kind))
             return true;
 
         if (!LooksLikeBuilding(obj))
             return false;
 
         Building* building = static_cast<Building*>(obj);
-        if (IsLeaderboardData(building->getGameData()))
+        if (GetLeaderboardDataKind(building->getGameData(), kind))
             return true;
-        if (IsLeaderboardData(TryGetFunctionalityData(building)))
+        if (GetLeaderboardDataKind(
+                TryGetFunctionalityData(building), kind))
             return true;
         return false;
     }
@@ -176,7 +204,16 @@ namespace ArenaIdentity
 
     bool IsLeaderboardFinished(Building* building)
     {
-        return IsLeaderboard(building) && IsBuildingFinished(building);
+        LeaderboardData::Kind kind = LeaderboardData::Player;
+        return GetFinishedLeaderboardKind(building, kind);
+    }
+
+    bool GetFinishedLeaderboardKind(
+        Building* building,
+        LeaderboardData::Kind& kind)
+    {
+        return GetLeaderboardKind(building, kind) &&
+            IsBuildingFinished(building);
     }
 
     void LogInteractIdentity(RootObject* obj, const char* where)
@@ -204,6 +241,6 @@ namespace ArenaIdentity
         msg += IsLeaderboard(obj) ? " [leaderboard]" : "";
         msg += IsRegistry(obj) ? " [registry]" : "";
         msg += IsBanner(obj) ? " [banner]" : "";
-        DebugLog(msg.c_str());
+        PGLog::Debug(msg.c_str());
     }
 }
