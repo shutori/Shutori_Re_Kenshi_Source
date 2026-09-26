@@ -94,6 +94,11 @@ namespace
     static const float kSettleHoldSec = 0.8f;
     static const float kIngressTimeoutSec = 20.0f;
     static const float kNpcFormationTimeoutSec = 30.0f;
+    // Extend only while every missing NPC is making measurable progress.
+    static const float kNpcFormationHardCapSec = 90.0f;
+    static const float kNpcFormationProgressLogSec = 10.0f;
+    static const float kNpcFormationStallSec = 20.0f;
+    static const float kNpcFormationProgressDistance = kFormationArrivalRadius;
     static const float kFightGatherHoldSec = 4.0f;
     static const float kFightCountdownSec = 2.25f;
     // RMB mouse-up cancels orders issued on the same click — wait it out, then keep re-issuing.
@@ -139,6 +144,16 @@ namespace
     std::vector<MatchRules::MatchTeam> g_teams;
     std::vector<Character*> g_escorts;
     std::vector<Ogre::Vector3> g_targets;
+    struct NpcFormationProgress
+    {
+        float checkpointDistance;
+        float lastProgressSec;
+        NpcFormationProgress(float distance, float elapsed)
+            : checkpointDistance(distance), lastProgressSec(elapsed) {}
+    };
+    std::vector<NpcFormationProgress> g_npcFormationProgress;
+    float g_nextNpcProgressLogSec = 0.0f;
+    bool g_npcGraceLogged = false;
     Character* g_uiOpener = NULL;
     std::string g_status = "Idle";
     bool g_issuingManagedMove = false;
@@ -611,6 +626,37 @@ namespace
         return HorizontalDistSq(c->getPosition(), g_targets[index]) <= radiusSq;
     }
 
+    void FaceOpposingFormation(size_t index)
+    {
+        if (index >= g_fighters.size() || g_teams.size() != g_targets.size())
+            return;
+        Character* fighter = g_fighters[index];
+        if (!fighter || !fighter->isValid() || fighter->isDead())
+            return;
+
+        // Use the opponent's assigned mark even before they arrive; the marks
+        // already account for the arena's orientation in world space.
+        size_t closest = g_targets.size();
+        float distance = 1.0e30f;
+        for (size_t other = 0; other < g_targets.size(); ++other)
+        {
+            if (other == index ||
+                (g_mode != MatchRules::ModeLastStanding && g_teams[other] == g_teams[index]))
+                continue;
+            const float candidate = HorizontalDistSq(fighter->getPosition(), g_targets[other]);
+            if (candidate < distance)
+            {
+                distance = candidate;
+                closest = other;
+            }
+        }
+        if (closest == g_targets.size() || distance <= 1.0f)
+            return;
+        Ogre::Vector3 face = g_targets[closest];
+        face.y = fighter->getPosition().y;
+        fighter->lookatPosition(face, true);
+    }
+
     void ParkArrivedFighters()
     {
         for (size_t i = 0; i < g_fighters.size(); ++i)
@@ -627,6 +673,7 @@ namespace
                 continue;
 
             ParkCharacterInPlace(fighter);
+            FaceOpposingFormation(i);
         }
     }
 
@@ -643,6 +690,70 @@ namespace
             }
         }
         return outside;
+    }
+
+    void LogNpcFormationProgress(const char* phase)
+    {
+        for (size_t i = 0; i < g_fighters.size() && i < g_targets.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            if (!fighter || !fighter->isValid()) continue;
+            const Ogre::Vector3 position = fighter->getPosition();
+            const float horizontal = sqrtf(HorizontalDistSq(position, g_targets[i]));
+            CharMovement* movement = fighter->getMovement();
+            const float progressAge = i < g_npcFormationProgress.size()
+                ? g_elapsedSec - g_npcFormationProgress[i].lastProgressSec : g_elapsedSec;
+            char detail[768];
+            sprintf_s(detail,
+                "Proving Grounds: NPC formation %s elapsed=%.1f slot=%u name=%s horizontal=%.1f vertical=%.1f atMark=%d progressAge=%.1f moving=%d speed=%.2f",
+                phase, g_elapsedSec, static_cast<unsigned>(i + 1), fighter->getName().c_str(),
+                horizontal, position.y - g_targets[i].y,
+                FighterAtMark(i, kFormationArrivalRadius) ? 1 : 0, progressAge,
+                movement && movement->isCurrentlyMoving() ? 1 : 0, fighter->getMovementSpeed());
+            PGLog::Debug(detail);
+        }
+    }
+
+    void BeginNpcFormationProgress()
+    {
+        g_npcFormationProgress.clear();
+        if (!TownArena::IsBusy() || TownArena::IsPlayerMatch() ||
+            g_pendingKind != PendingFormation) return;
+        for (size_t i = 0; i < g_fighters.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            const float distance = fighter && fighter->isValid()
+                ? sqrtf(HorizontalDistSq(fighter->getPosition(), g_targets[i])) : 0.0f;
+            g_npcFormationProgress.push_back(NpcFormationProgress(distance, g_elapsedSec));
+        }
+        g_nextNpcProgressLogSec = g_elapsedSec + kNpcFormationProgressLogSec;
+        g_npcGraceLogged = false;
+        LogNpcFormationProgress("start");
+    }
+
+    void UpdateNpcFormationProgress()
+    {
+        if (!TownArena::IsBusy() || TownArena::IsPlayerMatch() ||
+            g_pendingKind != PendingFormation) return;
+        if (g_npcFormationProgress.size() != g_fighters.size())
+            BeginNpcFormationProgress();
+        for (size_t i = 0; i < g_npcFormationProgress.size(); ++i)
+        {
+            Character* fighter = g_fighters[i];
+            if (!fighter || !fighter->isValid()) continue;
+            const float distance = sqrtf(HorizontalDistSq(fighter->getPosition(), g_targets[i]));
+            NpcFormationProgress& progress = g_npcFormationProgress[i];
+            if (distance <= progress.checkpointDistance - kNpcFormationProgressDistance)
+            {
+                progress.checkpointDistance = distance;
+                progress.lastProgressSec = g_elapsedSec;
+            }
+        }
+        if (g_elapsedSec >= g_nextNpcProgressLogSec)
+        {
+            LogNpcFormationProgress("sample");
+            g_nextNpcProgressLogSec = g_elapsedSec + kNpcFormationProgressLogSec;
+        }
     }
 
     void IssueFormationMoves()
@@ -737,7 +848,10 @@ namespace
             : "Fight starts in 3...";
         ParkArrivedFighters();
         for (size_t i = 0; i < g_fighters.size(); ++i)
+        {
             ParkCharacterInPlace(g_fighters[i]);
+            FaceOpposingFormation(i);
+        }
         if (g_pendingKind == PendingPrisonerRelease)
             PrisonerUtil::ParkMatchHandlers();
         if (TownAnnouncer::HasAnnouncement())
@@ -1269,6 +1383,7 @@ namespace ArenaIngress
         g_escortsParkIssued = false;
         g_lastTick = GetTickCount();
         PGLog::Debug("Proving Grounds: location ingress started");
+        BeginNpcFormationProgress();
         if (!TownArena::IsBusy())
             TownArena::CancelPlannedNpcBout("Player match took priority");
         return true;
@@ -1322,7 +1437,10 @@ namespace ArenaIngress
 
             // Keep everyone frozen so sit-around jobs can't pull them away.
             for (size_t i = 0; i < g_fighters.size(); ++i)
+            {
                 ParkCharacterInPlace(g_fighters[i]);
+                FaceOpposingFormation(i);
+            }
             if (PrisonerUtil::MatchIncludesPrisoner())
                 PrisonerUtil::ReinforceParkedHandlers();
 
@@ -1496,6 +1614,7 @@ namespace ArenaIngress
                 g_settleHoldSec = 0.0f;
                 g_nextMoveIssueSec = 0.0f;
                 IssueFormationMoves();
+                BeginNpcFormationProgress();
                 PGLog::Debug("Proving Grounds: all prisoners released - formation phase started");
             }
         }
@@ -1509,7 +1628,7 @@ namespace ArenaIngress
             g_nextMoveIssueSec = g_elapsedSec + kApproachMoveReissueSec;
         }
         ParkArrivedFighters();
-
+        UpdateNpcFormationProgress();
         observation = BuildIngressObservation();
         if (ArenaIngressPolicy::CanBeginCountdown(observation))
         {
@@ -1543,11 +1662,30 @@ namespace ArenaIngress
             outside, outside == 1 ? "" : "s");
         g_status = waiting;
 
-        // A healthy NPC can occasionally be stranded on disconnected town
-        // navigation. Do not let one actor hold the ambient scheduler forever.
+        // Give fighters making real progress time to reach their marks, but do
+        // not let disconnected navigation hold the wager indefinitely.
         if (TownArena::IsBusy() && !TownArena::IsPlayerMatch() &&
             g_elapsedSec >= kNpcFormationTimeoutSec)
         {
+            bool stalled = false;
+            for (size_t i = 0; i < g_fighters.size(); ++i)
+            {
+                if (!FighterAtMark(i, kFormationArrivalRadius) &&
+                    (i >= g_npcFormationProgress.size() ||
+                     g_elapsedSec - g_npcFormationProgress[i].lastProgressSec >= kNpcFormationStallSec))
+                    stalled = true;
+            }
+            const bool hardCap = g_elapsedSec >= kNpcFormationHardCapSec;
+            if (!stalled && !hardCap)
+            {
+                if (!g_npcGraceLogged)
+                {
+                    PGLog::Debug("Proving Grounds: NPC formation extended while missing fighters approach their marks");
+                    g_npcGraceLogged = true;
+                }
+                return;
+            }
+            const bool wagerPending = TownBookie::HasPendingWager();
             for (size_t i = 0; i < g_fighters.size(); ++i)
             {
                 Character* fighter = g_fighters[i];
@@ -1556,23 +1694,28 @@ namespace ArenaIngress
                 const Ogre::Vector3 target = g_targets[i];
                 const float horizontal = std::sqrt(HorizontalDistSq(position, target));
                 const bool blocked = !FighterAtMark(i, kFormationArrivalRadius);
+                const float progressAge = i < g_npcFormationProgress.size()
+                    ? g_elapsedSec - g_npcFormationProgress[i].lastProgressSec : g_elapsedSec;
+                const bool stuck = blocked && progressAge >= kNpcFormationStallSec;
                 CharMovement* movement = fighter->getMovement();
                 char detail[768];
                 sprintf_s(detail,
-                    "Proving Grounds: ingress timeout fighter slot=%u name=%s blocked=%d horizontal=%.1f vertical=%.1f moving=%d speed=%.2f position=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) destination=(%.1f,%.1f,%.1f)",
+                    "Proving Grounds: ingress timeout fighter slot=%u name=%s blocked=%d stalled=%d progressAge=%.1f horizontal=%.1f vertical=%.1f moving=%d speed=%.2f position=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) destination=(%.1f,%.1f,%.1f)",
                     static_cast<unsigned>(i + 1), fighter->getName().c_str(), blocked ? 1 : 0,
-                    horizontal, position.y - target.y,
+                    stuck ? 1 : 0, progressAge, horizontal, position.y - target.y,
                     movement && movement->isCurrentlyMoving() ? 1 : 0, fighter->getMovementSpeed(),
                     position.x, position.y, position.z, target.x, target.y, target.z,
                     movement ? movement->destination.x : 0.0f,
                     movement ? movement->destination.y : 0.0f,
                     movement ? movement->destination.z : 0.0f);
                 PGLog::Debug(detail);
-                if (blocked) TownArena::QuarantineIngressFighter(fighter);
+                if (stuck) TownArena::QuarantineIngressFighter(fighter);
             }
             Cancel();
-            g_status = "NPC formation timed out; unreachable fighters excluded and lineup cancelled";
-            PGLog::Debug("Proving Grounds: NPC formation timeout - cancelling lineup for retry");
+            g_status = hardCap ? "NPC formation hard cap reached; original lineup cancelled" :
+                "NPC formation stalled; original lineup cancelled";
+            if (wagerPending) g_status += "; wager refunded";
+            PGLog::Debug(("Proving Grounds: " + g_status).c_str());
         }
     }
 

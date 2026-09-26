@@ -14,6 +14,7 @@ public:
         captured=snapshot; captured.generation=generation; target=destination;
         error.clear(); pending=!target.empty() && !generation.empty();
     }
+    void SetSaveKey(const std::string& key) { captured.saveKey=key; }
     bool FinishSave(bool nativeSucceeded) {
         if (!pending) return false;
         pending=false;

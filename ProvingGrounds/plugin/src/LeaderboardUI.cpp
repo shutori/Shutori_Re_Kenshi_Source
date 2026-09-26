@@ -1,5 +1,6 @@
 #include "LeaderboardUI.h"
 #include "LeaderboardStore.h"
+#include "ArenaNativePersistence.h"
 #include "LeaderboardLayout.h"
 #include "NativeUI.h"
 #include "PGLog.h"
@@ -32,6 +33,8 @@ namespace
     MyGUI::EditBox* g_empty = NULL;
     MyGUI::ScrollView* g_scroll = NULL;
     MyGUI::Button* g_close = NULL;
+    MyGUI::Button* g_reset = NULL;
+    bool g_resetConfirm = false;
     MyGUI::TextBox* g_champions = NULL;
     MyGUI::Widget* g_championRails[2] = {};
     MyGUI::Widget* g_headerUnderline = NULL;
@@ -63,6 +66,29 @@ namespace
     }
 
     void OnCloseClicked(MyGUI::Widget*) { LeaderboardUI::Close(); }
+    void LayoutWindow();
+    void OnResetClicked(MyGUI::Widget*)
+    {
+        if (!ArenaNativePersistence::CanResetUnmatchedSidecar()) return;
+        if (!g_resetConfirm)
+        {
+            g_resetConfirm = true;
+            g_reset->setCaption("Confirm reset to zero");
+            return;
+        }
+        if (!ArenaNativePersistence::ResetUnmatchedSidecar())
+        {
+            g_resetConfirm = false;
+            g_reset->setCaption("Reset arena progress");
+            g_empty->setCaption("Arena reset could not be completed. Preserve this save and reload before retrying.");
+            return;
+        }
+        g_resetConfirm = false;
+        g_reset->setVisible(false);
+        g_subtitle->setCaption("Fresh arena progress - save this slot now, then reload it.");
+        g_empty->setCaption("Arena progress reset to zero. Save now to publish the new sidecar; the old sidecar is backed up, if present.");
+        LayoutWindow();
+    }
     void OnWindowButtonPressed(MyGUI::Widget*, const std::string& name)
     {
         if (name == "close" || name == "Close") LeaderboardUI::Close();
@@ -83,7 +109,8 @@ namespace
         g_window = NULL;
         g_subtitle = g_empty = NULL;
         g_scroll = NULL;
-        g_close = NULL;
+        g_close = g_reset = NULL;
+        g_resetConfirm = false;
         g_champions = NULL;
         g_championRails[0] = g_championRails[1] = NULL;
         g_headerUnderline = NULL;
@@ -462,8 +489,18 @@ namespace
         g_scroll->setCoord(gap, scrollTop, width, scrollHeight);
         g_scroll->setVisible(!g_rows.empty() && scrollHeight > 0);
         const int closeWidth = Max(g_close->getTextSize().width + 4 * gap, body * 6);
-        g_close->setCoord(Max(gap, (size.width - closeWidth) / 2), vertical.closeTop,
-            closeWidth < width ? closeWidth : width, vertical.closeHeight);
+        if (g_reset->getVisible())
+        {
+            const int resetWidth = Max(g_reset->getTextSize().width + 4 * gap, body * 11);
+            const int buttonWidth = Min(width / 2 - gap, Max(closeWidth, resetWidth));
+            g_reset->setCoord((size.width - 2 * buttonWidth - gap) / 2,
+                vertical.closeTop, buttonWidth, vertical.closeHeight);
+            g_close->setCoord(g_reset->getRight() + gap, vertical.closeTop,
+                buttonWidth, vertical.closeHeight);
+        }
+        else g_close->setCoord(Max(gap, (size.width - closeWidth) / 2),
+            vertical.closeTop, closeWidth < width ? closeWidth : width,
+            vertical.closeHeight);
         const int emptyHeight = WrappedHeight(g_empty, 2 * gap,
             scrollTop, Max(1, width - 2 * gap));
         g_empty->setSize(Max(1, width - 2 * gap),
@@ -526,6 +563,9 @@ namespace
             resource = "Kenshi_Button1";
             g_close = NativeUI::Button(client, initial, "PG_LeaderboardClose", "Close");
             g_close->eventMouseButtonClick += MyGUI::newDelegate(OnCloseClicked);
+            g_reset = NativeUI::Button(client, initial, "PG_LeaderboardReset", "Reset arena progress");
+            g_reset->eventMouseButtonClick += MyGUI::newDelegate(OnResetClicked);
+            g_reset->setVisible(false);
             FitWindowToScreen();
             return true;
         }
@@ -633,6 +673,14 @@ namespace
             g_empty->setCaption(town
                 ? "No town bouts recorded yet.\nComplete a town arena bout to open the standings."
                 : "No rated player fighters yet.\nComplete a player-v-player arena match to open the standings.");
+            g_resetConfirm = false;
+            g_reset->setCaption("Reset arena progress");
+            g_reset->setVisible(ArenaNativePersistence::CanResetUnmatchedSidecar());
+            if (g_reset->getVisible())
+            {
+                g_subtitle->setCaption("Arena progress blocked: no sidecar matches this native save.");
+                g_empty->setCaption("A matching sidecar and backups could not be recovered. Reset starts arena ratings, rewards and challenges from zero for this slot. Existing files are not deleted; a valid old sidecar will be backed up on the next save. Click Reset twice to confirm, then save immediately.");
+            }
             RebuildRows(standings, kind, source);
             g_empty->setVisible(standings.empty());
             g_scroll->setVisible(!standings.empty());
@@ -667,7 +715,7 @@ namespace LeaderboardUI
         PGLog::Debug("Proving Grounds: native leaderboard UI shown");
     }
 
-    void Close() { if (g_window) g_window->setVisible(false); }
+    void Close() { if (g_window) g_window->setVisible(false); g_resetConfirm=false; if (g_reset) g_reset->setCaption("Reset arena progress"); }
     bool IsVisible() { return g_window && g_window->getVisible(); }
 
     void Tick()

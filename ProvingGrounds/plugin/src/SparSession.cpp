@@ -265,6 +265,10 @@ namespace
         g_interBoutWaiting = NULL;
         ReleaseBench(FindParticipantIndex(g_activeA), "active-duel");
         ReleaseBench(FindParticipantIndex(g_activeB), "active-duel");
+        // A new Teams 1v1 opponent may have walked in after the initial
+        // formation; turn both fighters toward each other before engaging.
+        g_activeA->lookatPosition(g_activeB->getPosition(), true);
+        g_activeB->lookatPosition(g_activeA->getPosition(), true);
         Character* pair[2] = { g_activeA, g_activeB };
         MatchRules::MatchTeam teams[2] = { MatchRules::TeamA, MatchRules::TeamB };
         FightStarter::EngageMatch(pair, teams, 2, MatchRules::ModeTeams1v1);

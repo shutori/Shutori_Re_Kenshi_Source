@@ -1,4 +1,5 @@
 #include "TownBookie.h"
+#include "ArenaSnapshot.h"
 #include "CombatBalanceLog.h"
 #include "PGLog.h"
 #include "TownBookieUI.h"
@@ -326,6 +327,33 @@ namespace TownBookie {
         return true;
     }
     bool HasPendingWager() { return ticket.pending; }
+    void CapturePlannedNpcBout(ArenaPersistence::PlannedNpcBout& out) {
+        out.market = market;
+        out.wagerPending = ticket.pending;
+        out.wagerSide = ticket.side;
+        out.stake = ticket.stake;
+        out.payout = ticket.payout;
+    }
+    bool RestorePlannedNpcBout(const ArenaPersistence::PlannedNpcBout& saved) {
+        // BeginNpcBout clears the previous ticket. Only call after world teardown
+        // and restore the frozen ticket after the exact saved lineup is installed.
+        if (ticket.pending || (saved.wagerPending && (!market || !saved.market))) return false;
+        if (saved.wagerPending) {
+            ticket.side = saved.wagerSide;
+            ticket.stake = saved.stake;
+            ticket.payout = saved.payout;
+            ticket.pending = true;
+            selectedSide = ticket.side;
+            message = "Accepted wager restored with the announced lineup and quoted return.";
+        }
+        return true;
+    }
+    void RefundUnrestoredWager(const ArenaPersistence::PlannedNpcBout& saved) {
+        if (!saved.wagerPending || !LeaderboardStore::HasActiveSave()) return;
+        int& credit = LeaderboardStore::GetBookieCredit();
+        if (saved.stake <= INT_MAX - credit) credit += saved.stake;
+        PayCredit();
+    }
     void CombatStarted() {
         // TownArena also signals player challenges. Only an open NPC market
         // belongs to this controller; player bouts must not lock its UI forever.

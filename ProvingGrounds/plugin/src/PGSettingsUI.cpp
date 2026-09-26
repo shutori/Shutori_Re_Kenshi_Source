@@ -72,7 +72,7 @@ namespace
         "Easy challenge buy-in (Cats)", "Medium challenge buy-in (Cats)",
         "Hard challenge buy-in (Cats)", "Challenge opponent difficulty",
         "Offer refresh interval (in-game hours)", "First paid refresh cost (Cats)",
-        "Paid refresh cost multiplier", "Challenge cooldown (in-game hours)",
+        "Paid refresh cost multiplier", "Skarn cooldown (in-game hours)",
         "Challenge win Marks multiplier", "Unique-fighter Marks bonus multiplier",
         "Skarn Marks bonus multiplier", "Crowd performance", "F8 debug menu"
     };
@@ -92,7 +92,7 @@ namespace
         "How often challenge offers refresh in in-game hours; range 1-168.",
         "Starting Cats cost for the first paid offer refresh; range 1-1,000,000.",
         "Paid-refresh growth factor until a challenge is booked; range 1.00-10.00.",
-        "In-game hours after a challenge attempt before another can be booked; range 0-720.",
+        "In-game hours after a Skarn challenge attempt before another Skarn challenge can be booked; other challenges are unaffected. Range 0-720.",
         "Multiplier for Marks awarded for winning a challenge; range 0-100.",
         "Multiplier for the unique-fighter Marks bonus in challenges; range 0-100.",
         "Multiplier for Marks awarded for defeating Skarn; range 0-100.",

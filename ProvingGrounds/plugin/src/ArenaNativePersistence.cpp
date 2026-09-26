@@ -1,6 +1,7 @@
 #include "ArenaNativePersistence.h"
 #include "ArenaSaveCoordinator.h"
 #include "ArenaSnapshotFiles.h"
+#include "ArenaNativePath.h"
 #include "NativeSaveEvidence.h"
 #include "NativeSyncBoundary.h"
 #include "LeaderboardStore.h"
@@ -40,6 +41,8 @@ ArenaPersistence::Snapshot captured;
 unsigned long long epoch=0;
 bool attempt=false;
 std::string notice;
+bool resetAllowed=false;
+std::string resetPath, resetKey, resetGeneration;
 // Native serializers execute synchronously inside SaveManager::saveGame.
 // TLS prevents an unrelated thread/container from acquiring that association.
 __declspec(thread) unsigned long long activeSave=0;
@@ -85,8 +88,12 @@ bool FindEmergencySnapshot(const LoadContext& context,
     if(context.generation.empty()) return false;
     const std::string root=ParentFolder(context.source);
     if(root.empty()) return false;
-    WIN32_FIND_DATAA entry;
-    HANDLE search=FindFirstFileA((root+"/emergency_save_*").c_str(),&entry);
+    std::wstring pattern;
+    UINT codepage;
+    if(!ArenaPersistence::NativePath::Resolve(root+"/emergency_save_*",
+        pattern,codepage,error)) return false;
+    WIN32_FIND_DATAW entry;
+    HANDLE search=FindFirstFileW(pattern.c_str(),&entry);
     if(search==INVALID_HANDLE_VALUE) {
         const DWORD failure=GetLastError();
         if(failure!=ERROR_FILE_NOT_FOUND && failure!=ERROR_PATH_NOT_FOUND)
@@ -97,9 +104,10 @@ bool FindEmergencySnapshot(const LoadContext& context,
     std::vector<std::string> candidates;
     do {
         if((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)!=0 &&
-            entry.cFileName[0]!='.')
-            candidates.push_back(root+"/"+entry.cFileName);
-    } while(FindNextFileA(search,&entry));
+            entry.cFileName[0]!=L'.')
+            candidates.push_back(ArenaPersistence::NativePath::Utf8(
+                ArenaPersistence::NativePath::Parent(pattern)+L"/"+entry.cFileName));
+    } while(FindNextFileW(search,&entry));
     const DWORD failure=GetLastError();
     if(!FindClose(search)) {
         error="Could not close emergency save search"; return false;
@@ -166,17 +174,28 @@ void PrepareImportedSnapshot(ArenaPersistence::Snapshot& snapshot) {
     snapshot.challenges.skarnInProgress=false;
     snapshot.challenges.skarnLastEnd=0.0;
     snapshot.diagnostic.pending=TownDiagnosticData::Pending();
+    // Import discards the source world's announced lineup. The native Cats
+    // still reflect its accepted stake, so carry that stake back as a credit.
+    if(snapshot.plannedNpc.wagerPending)
+        snapshot.bookieCredit=snapshot.plannedNpc.stake;
+    snapshot.plannedNpc=ArenaPersistence::PlannedNpcBout();
 }
 // Only called under mutex. Storage operations are serialized against world
 // abandonment; no original engine calls, UI calls or logging happen here.
 std::string FinishIfReady() {
     if(!attempt || !evidence.Ready()) return "";
     const bool nativeOk=evidence.Succeeded();
-    const bool published=coordinator.FinishSave(nativeOk);
+    std::string key, keyError;
+    if(nativeOk && !ArenaPersistence::SnapshotFiles::SaveKey(
+        evidence.target,captured.saveKey,key,keyError))
+        keyError="Cannot resolve Unicode save identity: "+keyError;
+    if(nativeOk && keyError.empty()) coordinator.SetSaveKey(key);
+    const bool published=coordinator.FinishSave(nativeOk && keyError.empty());
     attempt=false;
     if(published) return "";
     const std::string reason=evidence.identityChecked && !evidence.identityOk ?
-        "fighter identity metadata could not be persisted; the identity adapter must be repaired/restarted before later arena saves can succeed" : coordinator.Error();
+        "fighter identity metadata could not be persisted; the identity adapter must be repaired/restarted before later arena saves can succeed" :
+        (!keyError.empty() ? keyError : coordinator.Error());
     return "Arena portion of save FAILED at "+Sidecar(evidence.target)+": "+reason+
         ". Live arena progress is retained. Preserve this slot and its backups; retry saving before leaving this world.";
 }
@@ -191,16 +210,14 @@ void (*syncOriginal)(SaveFileSystem*)=NULL;
 
 int Save(SaveManager* self,const std::string& location,const std::string& name) {
     if(!ready) return saveOriginal(self,location,name);
-    // Planned markets are session-only. Refund before both native Cats and the
-    // ledger are captured, including autosaves, so loading cannot lose a wager.
-    TownArena::CancelPlannedNpcBout("Scheduled bout cancelled for saving");
     ArenaPersistence::Snapshot snapshot; std::string generation;
     const bool identityReady=FighterIdentity::CanPersist();
-    if(!identityReady || !LeaderboardStore::CaptureSnapshot(snapshot) || !NewGeneration(generation)) {
+    if(!identityReady || !LeaderboardStore::CaptureSnapshot(snapshot) ||
+        !TownArena::CapturePlannedNpcBout(snapshot.plannedNpc) || !NewGeneration(generation)) {
         ArenaNativePersistence::AbandonWorld();
         std::string reason=identityReady ? LeaderboardStore::GetPersistenceError() :
             "fighter identity persistence is unhealthy; preserve this slot/backups and restart the game before reloading a known-good slot";
-        if(reason.empty()) reason="the arena ledger is not ready, a reward transaction is pending, or a snapshot generation could not be created";
+        if(reason.empty()) reason="the arena ledger, announced lineup identity, or snapshot generation could not be captured";
         Report("Arena portion of save unavailable: "+reason+". Wait for any reward delivery to finish, then retry saving. Native game save will continue; arena data will not be published.");
         return saveOriginal(self,location,name);
     }
@@ -311,12 +328,20 @@ void ActivateLoad(const LoadContext& context,int result) {
     }
     const std::string path=Sidecar(context.source);
     std::string loadedPath=path;
-    ArenaPersistence::LoadResult loaded=ArenaPersistence::LoadSnapshot(files,path,context.name,context.generation);
+    std::string saveKey, keyError;
+    if(!ArenaPersistence::SnapshotFiles::SaveKey(context.source,context.name,
+        saveKey,keyError)) {
+        LeaderboardStore::BlockPersistence(keyError);
+        Report("Arena progress blocked: "+keyError+". Preserve the save and reload after correcting its path.");
+        return;
+    }
+    ArenaPersistence::LoadResult loaded=ArenaPersistence::LoadSnapshot(files,path,saveKey,context.generation);
     std::string emergencyError;
     if(!context.imported && loaded.code==ArenaPersistence::WrongSnapshot) {
         ArenaPersistence::LoadResult emergency;
         std::string emergencyPath;
-        if(FindEmergencySnapshot(context,emergency,emergencyPath,
+        LoadContext normalized=context; normalized.name=saveKey;
+        if(FindEmergencySnapshot(normalized,emergency,emergencyPath,
             emergencyError)) {
             loaded=emergency; loadedPath=emergencyPath;
             loaded.message="Recovered generation-matched arena progress from emergency save "+emergencyPath;
@@ -329,11 +354,14 @@ void ActivateLoad(const LoadContext& context,int result) {
             // Emergency saves clone native metadata and the sidecar without
             // changing its old slot name. The generation is the authoritative
             // identity; bind the recovered snapshot to the slot now loaded.
-            snapshot.saveKey=context.name;
+            snapshot.saveKey=saveKey;
             snapshot.generation=context.generation;
         }
         LeaderboardStore::ActivateSnapshot(snapshot);
-        if(!context.imported) TownDiagnosticRun::RecoverPendingAfterLoad();
+        if(!context.imported) {
+            TownArena::RestorePlannedNpcBout(snapshot.plannedNpc);
+            if(!snapshot.plannedNpc.active) TownDiagnosticRun::RecoverPendingAfterLoad();
+        }
         Log(std::string(context.imported ? "Imported" : "Loaded")+
             " arena snapshot from "+loadedPath+" generation="+context.generation+
             (context.imported ? "; destination identity will bind on first save" : ""));
@@ -352,15 +380,19 @@ void ActivateLoad(const LoadContext& context,int result) {
         return;
     }
     if(loaded.code==ArenaPersistence::Missing || loaded.code==ArenaPersistence::LegacyReset) {
-        ArenaPersistence::Snapshot fresh; fresh.saveKey=context.name;
+        ArenaPersistence::Snapshot fresh; fresh.saveKey=saveKey;
         LeaderboardStore::ActivateSnapshot(fresh);
         if(loaded.code==ArenaPersistence::LegacyReset) Report("Legacy arena progress reset. Original JSON will be backed up when this slot is next saved.");
         else if(context.imported) Log("Imported world has no matching arena sidecar; activated a fresh arena ledger.");
         return;
     }
     const std::string error=path+" "+loaded.field+": "+loaded.message;
+    if(loaded.code==ArenaPersistence::WrongSnapshot) {
+        Guard lock; resetAllowed=true; resetPath=path;
+        resetKey=saveKey; resetGeneration=context.generation;
+    }
     LeaderboardStore::BlockPersistence(error);
-    Report("Arena progress blocked: "+error+". Preserve the file/backups, correct the JSON or restore a matching native save, then reload.");
+    Report("Arena progress blocked: "+error+". Preserve the file/backups or use the leaderboard's explicit reset to start arena progress from zero for this slot.");
 }
 int Load(SaveManager* self,const std::string& location,const std::string& name) {
     if(!ready) return loadOriginal(self,location,name);
@@ -382,9 +414,23 @@ int Import(SaveManager* self,const std::string& location,const std::string& name
 }
 namespace ArenaNativePersistence {
 void Disable() { ready=false; AbandonWorld(); LeaderboardStore::BlockPersistence("Required native lifecycle/identity hooks are unavailable"); }
-void AbandonWorld() { Guard lock; ++epoch; attempt=false; coordinator.AbandonWorld(); evidence=ArenaPersistence::NativeSaveEvidence(); captured=ArenaPersistence::Snapshot(); notice.clear(); }
+void AbandonWorld() { Guard lock; ++epoch; attempt=false; coordinator.AbandonWorld(); evidence=ArenaPersistence::NativeSaveEvidence(); captured=ArenaPersistence::Snapshot(); notice.clear(); resetAllowed=false; resetPath.clear(); resetKey.clear(); resetGeneration.clear(); }
 bool IsLoading() { return activeLoad!=NULL; }
 bool IsReady() { return ready; }
+bool CanResetUnmatchedSidecar() { Guard lock; return resetAllowed; }
+bool ResetUnmatchedSidecar() {
+    Guard lock;
+    if(!ready || !resetAllowed) return false;
+    const ArenaPersistence::LoadResult check=ArenaPersistence::LoadSnapshot(
+        files,resetPath,resetKey,resetGeneration);
+    if(check.code!=ArenaPersistence::WrongSnapshot) return false;
+    ArenaPersistence::Snapshot fresh;
+    fresh.saveKey=resetKey; fresh.generation=resetGeneration;
+    resetAllowed=false; resetPath.clear(); resetKey.clear(); resetGeneration.clear();
+    LeaderboardStore::ActivateSnapshot(fresh);
+    Log("Player explicitly reset unmatched arena progress; save this slot now to publish a matching sidecar.");
+    return true;
+}
 void Tick() { std::string text; { Guard lock; text.swap(notice); } if(!text.empty() && ou) ou->showPlayerAMessage(text,true); }
 bool InstallHooks() {
     bool ok=true;

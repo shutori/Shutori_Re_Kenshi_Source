@@ -6,6 +6,7 @@ class Building;
 class Faction;
 namespace TownChallengeBuyInPolicy { struct Quote; }
 namespace SparPodium { struct Snapshot; }
+namespace ArenaPersistence { struct PlannedNpcBout; }
 
 namespace TownArena
 {
@@ -55,8 +56,11 @@ namespace TownArena
     bool HasPlannedNpcBout();
     double GetPlannedNpcStartHours();
     void CancelPlannedNpcBout(const std::string& reason);
+    bool CapturePlannedNpcBout(ArenaPersistence::PlannedNpcBout& out);
+    void RestorePlannedNpcBout(const ArenaPersistence::PlannedNpcBout& saved);
     void Tick();
     void Cancel();
+    void CancelForSave();
     void AbandonWorldState();
     bool IsBusy();
     bool IsAftercare();

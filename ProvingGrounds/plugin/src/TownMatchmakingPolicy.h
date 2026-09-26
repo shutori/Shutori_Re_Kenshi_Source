@@ -132,14 +132,17 @@ inline int NamedDivision(const std::string& role) {
 }
 struct ById { bool operator()(const Fighter& a, const Fighter& b) const { return a.id < b.id; } };
 struct ByPower {
+    double influence;
+    explicit ByPower(double ratingInfluence = RatingInfluence()) : influence(ratingInfluence) {}
     bool operator()(const Fighter& a, const Fighter& b) const {
-        const double left = FighterPower(a.ability, a.mmr);
-        const double right = FighterPower(b.ability, b.mmr);
+        const double left = FighterPower(a.ability, a.mmr, influence);
+        const double right = FighterPower(b.ability, b.mmr, influence);
         return left == right ? a.id < b.id : left < right;
     }
 };
 inline std::vector<Fighter> Roster(const std::vector<Fighter>& input, unsigned seed,
-    const std::set<std::string>& excluded, const std::string& anchor) {
+    const std::set<std::string>& excluded, const std::string& anchor,
+    double influence = RatingInfluence()) {
     std::map<std::string, int> counts;
     for (size_t i = 0; i < input.size(); ++i) ++counts[input[i].id];
     std::vector<Fighter> regular, named;
@@ -151,7 +154,7 @@ inline std::vector<Fighter> Roster(const std::vector<Fighter>& input, unsigned s
         }
         else if (TownFighterCatalog::Find(f.role.c_str())) regular.push_back(f);
     }
-    std::sort(regular.begin(), regular.end(), ByPower());
+    std::sort(regular.begin(), regular.end(), ByPower(influence));
     std::sort(named.begin(), named.end(), ById());
     // Keep the bounded search representative across the entire strength range.
     // An identity-contiguous sample could omit every weak opponent and falsely
@@ -246,19 +249,21 @@ inline Match SelectPlayer(const std::vector<Fighter>& players, const std::vector
     if (players.empty() || players.size() > 3 || division < Easy || division > Hard ||
         rarity < -1 || rarity > 3 || maxEnemies < 1 || maxTotal < 2) return empty;
     if (!requiredRole.empty() && (!Detail::Named(requiredRole) || Detail::NamedDivision(requiredRole) != division)) return empty;
+    // Player challenges use combat ability alone; only NPC-vs-NPC searches use MMR.
+    const double influence = 0.0;
     std::set<std::string> playerIds;
     double values[3], ratings[3], strongest = 0;
     for (size_t i = 0; i < players.size(); ++i) {
         if (players[i].id.empty() || !playerIds.insert(players[i].id).second) return empty;
         values[i] = players[i].ability;
         ratings[i] = players[i].mmr;
-        strongest = (std::max)(strongest, FighterPower(values[i], ratings[i]));
+        strongest = (std::max)(strongest, FighterPower(values[i], ratings[i], influence));
     }
-    const double playerScore = TeamScore(values, ratings, static_cast<int>(players.size()));
+    const double playerScore = TeamScore(values, ratings, static_cast<int>(players.size()), influence);
     if (playerScore <= 0) return empty;
     const int limit = (std::min)(4, (std::min)(maxEnemies, maxTotal - static_cast<int>(players.size())));
     if (limit < 1) return empty;
-    const std::vector<Fighter> roster = Detail::Roster(npcs, seed, playerIds, requiredRole);
+    const std::vector<Fighter> roster = Detail::Roster(npcs, seed, playerIds, requiredRole, influence);
     const std::map<std::string, std::string> types = Detail::Types(roster);
     static const double low[] = { .55, .85, 1.15 }, high[] = { .80, 1.10, 1.45 }, target[] = { .70, 1.00, 1.30 };
     // Challenge rarity describes actual relative team strength. Direct bookings
@@ -285,7 +290,7 @@ inline Match SelectPlayer(const std::vector<Fighter>& players, const std::vector
             std::vector<int> anchor(1, static_cast<int>(i));
             Match duel;
             duel.scoreA = playerScore;
-            duel.scoreB = Detail::Score(roster, anchor, duel.b);
+            duel.scoreB = Detail::Score(roster, anchor, duel.b, influence);
             if (duel.scoreB <= 0) return empty;
             duel.valid = true;
             duel.a.assign(playerIds.begin(), playerIds.end());
@@ -299,7 +304,7 @@ inline Match SelectPlayer(const std::vector<Fighter>& players, const std::vector
     bool sawSingleton = false;
     for (size_t i = 0; i < roster.size(); ++i) {
         if (!requiredRole.empty() && roster[i].role != requiredRole) continue;
-        const double score = FighterPower(roster[i].ability, roster[i].mmr);
+        const double score = FighterPower(roster[i].ability, roster[i].mmr, influence);
         if (score <= 0) continue;
         sawSingleton = true;
         weakestSingle = (std::min)(weakestSingle, score / playerScore);
@@ -339,14 +344,14 @@ inline Match SelectPlayer(const std::vector<Fighter>& players, const std::vector
                 for (size_t n = 0; n < indices.size(); ++n) {
                     const Fighter& f = roster[indices[n]];
                     anchor = anchor || f.role == requiredRole;
-                    overwhelming = overwhelming || FighterPower(f.ability, f.mmr) > strongest;
+                    overwhelming = overwhelming || FighterPower(f.ability, f.mmr, influence) > strongest;
                 }
                 // Challenge bands already account for both teams and headcount;
                 // one stronger NPC can still be easy for two or three players.
                 if (!anchor || (division == Easy && rarity < 0 && overwhelming)) continue;
                 Match candidate;
                 candidate.scoreA = playerScore;
-                candidate.scoreB = Detail::Score(roster, indices, candidate.b);
+                candidate.scoreB = Detail::Score(roster, indices, candidate.b, influence);
                 if (candidate.scoreB <= 0) continue;
                 const double rawRatio = candidate.scoreB / playerScore;
                 const double ratio = rawRatio /

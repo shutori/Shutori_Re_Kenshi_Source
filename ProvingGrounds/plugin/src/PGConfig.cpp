@@ -591,7 +591,7 @@ namespace PGConfig
                 "        \"refresh_base_cost_cats\": 500,\n"
                 "        // Price multiplier per paid refresh (1.0-10.0); whole-Cat prices round to nearest; 2.0 doubles\n"
                 "        \"refresh_cost_multiplier\": 2.0,\n"
-                "        // In-game hours after any challenge attempt; 0 disables the cooldown\n"
+                "        // In-game hours after a Skarn challenge attempt before another Skarn challenge; 0 disables the cooldown\n"
                 "        \"cooldown_hours\": 24,\n"
                 "        \"marks\": {\n"
                 "            // Multipliers: 1.0 keeps the shipped reward\n"
@@ -601,7 +601,7 @@ namespace PGConfig
                 "            // Skarn victory bonus: 100 Marks\n"
                 "            \"skarn_bonus_multiplier\": 1.0\n"
                 "        }\n"
-                "    }\n",
+                "    },\n",
                 g_challengeBase[0], g_challengeBase[1], g_challengeBase[2]);
             out += line;
             out += "    // Arena performance and plugin UI\n"

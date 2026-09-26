@@ -3,6 +3,7 @@
 #include "MedicSupplyPolicy.h"
 #include "SparSession.h"
 #include "TownAftercare.h"
+#include "TownArena.h"
 #include "TownArenaRuntimePolicy.h"
 
 #include "PGLog.h"
@@ -37,6 +38,38 @@ namespace
     bool (*applyDoctoring_orig)(MedicalSystem*, float, Item*, float, Character*) = NULL;
     bool (*applyRigging_orig)(MedicalSystem*, float, Item*, float) = NULL;
 
+    bool (*shouldIHelpThisGuy_orig)(Character*, Character*) = NULL;
+    void (*pickupObject_orig)(Character*, Character*) = NULL;
+
+    bool IsScratchMedicActor(Character* actor)
+    {
+        GameData* data = actor && actor->isValid() ? actor->getGameData() : NULL;
+        return data && TownArenaRuntimePolicy::IsMedic(data->stringID.c_str());
+    }
+
+    bool BlockTownBystander(Character* actor, Character* patient)
+    {
+        // Player-arena fights, including prisoner handlers, keep their existing care.
+        return patient && TownArena::IsFighter(patient) && TownArena::OwnsMatch() &&
+            !IsScratchMedicActor(actor);
+    }
+
+    bool shouldIHelpThisGuy_hook(Character* self, Character* patient)
+    {
+        if (BlockTownBystander(self, patient))
+            return false;
+        return shouldIHelpThisGuy_orig(self, patient);
+    }
+
+    void pickupObject_hook(Character* self, Character* patient)
+    {
+        // Rescue jobs can bypass the ally-help check; only medics may carry
+        // town fighters away while their bout is still in progress.
+        if (BlockTownBystander(self, patient))
+            return;
+        pickupObject_orig(self, patient);
+    }
+
     ItemFunction FunctionFor(MedicSupplyPolicy::Supply supply)
     {
         return supply == MedicSupplyPolicy::RobotRepair ? ITEM_ROBOTREPAIR : ITEM_FIRSTAID;
@@ -51,8 +84,7 @@ namespace
 
         bool IsScratchMedic() const
         {
-            GameData* data = medic && medic->isValid() ? medic->getGameData() : NULL;
-            return data && TownArenaRuntimePolicy::IsMedic(data->stringID.c_str());
+            return IsScratchMedicActor(medic);
         }
 
         bool InventoryHasUsableKit(Inventory* inventory,
@@ -122,10 +154,10 @@ namespace
             PGLog::Error(line);
     }
 
-    bool BlockFor(MedicalSystem* medical)
+    bool BlockFor(MedicalSystem* medical, Character* actor)
     {
         Character* target = medical ? medical->me : NULL;
-        return ArenaMedical::ShouldBlockTreatment(
+        return (actor && BlockTownBystander(actor, target)) || ArenaMedical::ShouldBlockTreatment(
             g_protocol,
             SparSession::IsActive(),
             SparSession::IsParticipant(target),
@@ -139,7 +171,7 @@ namespace
         float frameTime,
         Character* who)
     {
-        const bool blocked = BlockFor(thisptr);
+        const bool blocked = BlockFor(thisptr, who);
         const float chargesBefore = equipment ? equipment->chargesLeft : 0.0f;
         const bool complete = !blocked && applyFirstAid_orig(thisptr, skill, equipment, frameTime, who);
         if (!blocked)
@@ -155,7 +187,7 @@ namespace
         float frameTime,
         Character* who)
     {
-        const bool blocked = BlockFor(thisptr);
+        const bool blocked = BlockFor(thisptr, who);
         const float chargesBefore = equipment ? equipment->chargesLeft : 0.0f;
         const bool complete = !blocked && applyDoctoring_orig(thisptr, skill, equipment, frameTime, who);
         if (!blocked)
@@ -170,7 +202,8 @@ namespace
         Item* equipment,
         float frameTime)
     {
-        if (BlockFor(thisptr))
+        // applyRigging does not expose the actor; preserve the existing protocol.
+        if (BlockFor(thisptr, NULL))
             return false;
         return applyRigging_orig(thisptr, skill, equipment, frameTime);
     }
@@ -236,6 +269,22 @@ namespace ArenaMedical
     bool InstallHooks()
     {
         bool ok = true;
+        if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+                KenshiLib::GetRealAddress(&Character::shouldIHelpThisGuy),
+                shouldIHelpThisGuy_hook,
+                &shouldIHelpThisGuy_orig))
+        {
+            PGLog::Error("Proving Grounds: failed to hook Character::shouldIHelpThisGuy");
+            ok = false;
+        }
+        if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+                KenshiLib::GetRealAddress(&Character::pickupObject),
+                pickupObject_hook,
+                &pickupObject_orig))
+        {
+            PGLog::Error("Proving Grounds: failed to hook Character::pickupObject");
+            ok = false;
+        }
         if (KenshiLib::SUCCESS != KenshiLib::AddHook(
                 KenshiLib::GetRealAddress(&MedicalSystem::applyFirstAid),
                 applyFirstAid_hook,

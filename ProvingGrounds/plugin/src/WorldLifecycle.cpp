@@ -114,7 +114,7 @@ namespace
 
         // This path runs before Kenshi serialises the world, while actors are
         // still valid. Restore native combat state and cage prisoners first.
-        TownArena::Cancel();
+        TownArena::CancelForSave();
         ArenaIngress::Cancel();
         SparSession::AbortForSave();
 

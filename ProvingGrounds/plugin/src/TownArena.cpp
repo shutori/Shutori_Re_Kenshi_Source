@@ -6,6 +6,7 @@
 #include "TownCorpseCleanup.h"
 #include "TownAnnouncer.h"
 #include "TownBookie.h"
+#include "ArenaSnapshot.h"
 #include "TownSpectators.h"
 #include "TownAftercarePolicy.h"
 #include "ArenaRingGuard.h"
@@ -74,6 +75,9 @@ namespace
     TownMatchmakingPolicy::Match g_plannedNpc;
     hand g_plannedRegistry;
     std::vector<hand> g_plannedFighters;
+    ArenaPersistence::PlannedNpcBout g_restoredNpc;
+    bool g_restoredNpcPending = false;
+    double g_restoreObservedHours = 0.0;
     DWORD g_lastScheduleCheck = 0;
     hand g_fighters[16];
     MatchRules::MatchTeam g_fighterTeams[16];
@@ -444,9 +448,15 @@ namespace TownArena
     struct NpcPreparation {
         bool Ready() { return TownBookie::PreparationValid(); }
         void Cancel() {
+            const bool wagerPending = TownBookie::HasPendingWager();
+            const std::string ingressStatus = ArenaIngress::GetStatus();
+            const bool formationFailure = !ArenaIngress::IsPending() &&
+                ingressStatus.find("NPC formation ") == 0;
             ArenaIngress::Cancel();
             TownDiagnosticRun::RetryPending();
-            Finish("NPC bout cancelled: locked fighter unavailable or recovering; wager refunded");
+            Finish((formationFailure ? ingressStatus :
+                "NPC bout cancelled: locked fighter unavailable or recovering") +
+                (wagerPending && !formationFailure ? "; wager refunded" : ""));
         }
     };
     bool ValidatePreparation() {
@@ -580,8 +590,41 @@ namespace TownArena
     }
     bool HasPlannedNpcBout() { return g_plannedNpc.valid; }
     double GetPlannedNpcStartHours() { return g_plannedNpc.valid ? g_nextNpcHours : 0.0; }
+    bool CapturePlannedNpcBout(ArenaPersistence::PlannedNpcBout& out) {
+        out = ArenaPersistence::PlannedNpcBout();
+        if (!g_plannedNpc.valid) return !TownBookie::HasPendingWager();
+        if (g_restoredNpcPending) { out = g_restoredNpc; return true; }
+        Building* registry = g_plannedRegistry.getBuilding();
+        InstanceID* id = registry && registry->isValid() ? registry->getInstanceID() : NULL;
+        if (!id || id->uid.empty()) return false;
+        out.active = true;
+        out.registryId = id->uid;
+        out.startHours = g_nextNpcHours;
+        out.scoreA = g_plannedNpc.scoreA; out.scoreB = g_plannedNpc.scoreB;
+        out.teamA = g_plannedNpc.a; out.teamB = g_plannedNpc.b;
+        TownBookie::CapturePlannedNpcBout(out);
+        return true;
+    }
+    void RestorePlannedNpcBout(const ArenaPersistence::PlannedNpcBout& saved) {
+        if (!saved.active) return;
+        g_restoredNpc = saved;
+        g_restoredNpcPending = true;
+        g_restoreObservedHours = 0.0;
+        g_plannedNpc = TownMatchmakingPolicy::Match();
+        g_plannedNpc.valid = true;
+        g_plannedNpc.a = saved.teamA; g_plannedNpc.b = saved.teamB;
+        g_plannedNpc.scoreA = saved.scoreA; g_plannedNpc.scoreB = saved.scoreB;
+        g_nextNpcHours = saved.startHours;
+        Status("Saved NPC lineup and wager waiting for the original fighters to load");
+    }
     void CancelPlannedNpcBout(const std::string& reason) {
         if (!g_plannedNpc.valid) return;
+        if (g_restoredNpcPending) {
+            TownBookie::RefundUnrestoredWager(g_restoredNpc);
+            g_restoredNpcPending = false;
+            g_restoredNpc = ArenaPersistence::PlannedNpcBout();
+            g_restoreObservedHours = 0.0;
+        }
         g_plannedNpc = TownMatchmakingPolicy::Match();
         g_plannedRegistry.setNull(); g_plannedFighters.clear();
         g_nextNpcHours = 0.0;
@@ -590,6 +633,7 @@ namespace TownArena
         TownDiagnosticRun::CancelPending();
     }
     static bool PlannedNpcReady() {
+        if (g_restoredNpcPending) return false;
         Building* registry = g_plannedRegistry.getBuilding();
         if (!registry || !registry->isValid() || !ArenaIdentity::IsRegistryFinished(registry)) return false;
         for (size_t i = 0; i < g_plannedFighters.size(); ++i) {
@@ -633,9 +677,8 @@ namespace TownArena
         g_plannedRegistry = registry;
         g_plannedFighters.clear();
         for (size_t i = 0; i < fighters.size(); ++i) g_plannedFighters.push_back(hand(fighters[i]));
-        // Lead time comes from BalanceTuning so the exposure window - any save
-        // inside it destroys the announced bout - can be compared against the
-        // shipped 1.0-2.0 h window without a rebuild. Defaults reproduce it exactly.
+        // Lead time comes from BalanceTuning; defaults reproduce the shipped
+        // 1.0-2.0 h announcement window exactly.
         const BalanceTuning::Values& tuning = BalanceTuning::Get();
         const unsigned delay = TownMatchmakingPolicy::Detail::Hash(card.ambientSeed, "next NPC start") % 61;
         g_nextNpcHours = std::ceil((ou->getTimeStamp_inGameHours().getTotalHours() +
@@ -1056,11 +1099,9 @@ namespace TownArena
         const bool playerWon = result.outcome == SparPodium::OutcomeTeamAWins;
         SettleChallenge(playerWon ? 1 : result.outcome == SparPodium::OutcomeTeamBWins ? 0 : -1);
         const double endedHours = ou ? ou->getTimeStamp_inGameHours().getTotalHours() : -1.0;
-        if (endedHours >= 0.0 && endedHours <= 24000000.0)
-        {
-            LeaderboardStore::GetTownChallenges().lastChallengeEndHours = endedHours;
-            LeaderboardStore::GetTownChallenges().hasChallengeEnd = true;
-        }
+        if (g_activeChallenge >= 0)
+            TownChallengePolicy::RecordSkarnChallengeEnd(
+                LeaderboardStore::GetTownChallenges(), g_challengeReservation, endedHours);
         std::vector<std::string> history;
         for (int i = g_playerCount; i < g_fighterCount; ++i) {
             const std::string id = PersistentId(g_fighters[i].getCharacter());
@@ -1102,11 +1143,9 @@ namespace TownArena
             return;
         }
         const double endedHours = ou ? ou->getTimeStamp_inGameHours().getTotalHours() : -1.0;
-        if (g_activeChallenge >= 0 && endedHours >= 0.0 && endedHours <= 24000000.0)
-        {
-            LeaderboardStore::GetTownChallenges().lastChallengeEndHours = endedHours;
-            LeaderboardStore::GetTownChallenges().hasChallengeEnd = true;
-        }
+        if (g_activeChallenge >= 0)
+            TownChallengePolicy::RecordSkarnChallengeEnd(
+                LeaderboardStore::GetTownChallenges(), g_challengeReservation, endedHours);
     }
     std::string GetChallengeCaption(int slot, bool includeLineup)
     {
@@ -1171,13 +1210,13 @@ namespace TownArena
         }
         const int required = TownChallengePolicy::Players(offer);
         const double gameHours = ou ? ou->getTimeStamp_inGameHours().getTotalHours() : -1.0;
-        if (TownChallengePolicy::ChallengeCooldownActive(card, gameHours,
+        if (TownChallengePolicy::ChallengeCooldownActive(card, offer, gameHours,
             PGConfig::ChallengeValues().cooldownHours))
         {
             const double remaining = PGConfig::ChallengeValues().cooldownHours -
-                (gameHours - card.lastChallengeEndHours);
+                (gameHours - card.skarnLastEnd);
             char message[128];
-            sprintf_s(message, "Challenge cooldown: %.1f in-game hours remaining", remaining);
+            sprintf_s(message, "Skarn cooldown: %.1f in-game hours remaining", remaining);
             Status(message);
             return false;
         }
@@ -1742,6 +1781,12 @@ namespace TownArena
     void Cancel()
     {
         CancelPlannedNpcBout("Scheduled bout cancelled");
+        CancelForSave();
+    }
+    void CancelForSave()
+    {
+        // A distinct next market may already be announced during aftercare.
+        // Abort the active operation without refunding that future wager.
         if (g_bookingPending) CancelBooking();
         if (!IsBusy()) return;
         if (g_phase == Preparing && ArenaIngress::IsPending()) ArenaIngress::Cancel();
@@ -1781,6 +1826,9 @@ namespace TownArena
         g_nextNpcHours = 0.0;
         g_plannedNpc = TownMatchmakingPolicy::Match();
         g_plannedRegistry.setNull(); g_plannedFighters.clear();
+        g_restoredNpc = ArenaPersistence::PlannedNpcBout();
+        g_restoredNpcPending = false;
+        g_restoreObservedHours = 0.0;
         for (int i = 0; i < 16; ++i) g_fighters[i].setNull();
         g_fighterCount = 0;
         g_playerCount = 0;
@@ -1825,7 +1873,7 @@ namespace TownArena
 
         // An announced ambient bout must not survive after Scratch becomes
         // unobserved. Paid player bookings remain queued for the squad's return.
-        if (g_plannedNpc.valid &&
+        if (g_plannedNpc.valid && !g_restoredNpcPending &&
             !HasPlayerInRegistryTown(g_plannedRegistry.getBuilding()))
         {
             CancelPlannedNpcBout("Scheduled bout cancelled: no player characters remain in Scratch");
@@ -1839,6 +1887,56 @@ namespace TownArena
         TownCorpseCleanup::Tick();
         TownAftercare::TickBedRecovery();
         const DWORD now = GetTickCount();
+        if (g_restoredNpcPending) {
+            if (ou->isPaused()) return;
+            if (g_lastScheduleCheck && now - g_lastScheduleCheck < 5000) return;
+            g_lastScheduleCheck = now;
+            Building* registry = g_townRegistry.getBuilding();
+            InstanceID* id = registry && registry->isValid() ? registry->getInstanceID() : NULL;
+            if (!id || id->uid != g_restoredNpc.registryId) {
+                DiscoverTownRegistry();
+                registry = g_townRegistry.getBuilding();
+                id = registry && registry->isValid() ? registry->getInstanceID() : NULL;
+            }
+            if (id && id->uid == g_restoredNpc.registryId &&
+                ArenaIdentity::IsRegistryFinished(registry) &&
+                HasPlayerInRegistryTown(registry)) {
+                const double hours = ou->getTimeStamp_inGameHours().getTotalHours();
+                if (!g_restoreObservedHours) g_restoreObservedHours = hours;
+                const std::vector<Character*> noPlayers;
+                const TownMatchmakingRuntime::Snapshot snapshot = SnapshotFor(noPlayers);
+                std::vector<Character*> fighters;
+                std::vector<MatchRules::MatchTeam> teams;
+                bool ready = true;
+                for (int side = 0; side < 2; ++side) {
+                    const std::vector<std::string>& ids = side ? g_restoredNpc.teamB : g_restoredNpc.teamA;
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        Character* fighter = TownMatchmakingRuntime::Resolve(snapshot, ids[i]);
+                        if (!fighter || !IsNpcReadyForPreparation(fighter) ||
+                            fighter->getCurrentTownLocation() != registry->getTown() ||
+                            TownAftercare::IsManaged(fighter) || TownLimbShop::IsManaged(fighter)) ready = false;
+                        fighters.push_back(fighter);
+                        teams.push_back(side ? MatchRules::TeamB : MatchRules::TeamA);
+                    }
+                }
+                if (ready) {
+                    TownBookie::BeginNpcBout(&fighters[0], &teams[0],
+                        static_cast<int>(fighters.size()), g_restoredNpc.scoreA, g_restoredNpc.scoreB);
+                    if (TownBookie::RestorePlannedNpcBout(g_restoredNpc)) {
+                        g_plannedRegistry = registry;
+                        g_plannedFighters.clear();
+                        for (size_t i = 0; i < fighters.size(); ++i)
+                            g_plannedFighters.push_back(hand(fighters[i]));
+                        g_restoredNpcPending = false;
+                        g_restoredNpc = ArenaPersistence::PlannedNpcBout();
+                        g_restoreObservedHours = 0.0;
+                        Status("Saved NPC lineup and wager restored");
+                    } else CancelPlannedNpcBout("Saved NPC lineup could not reopen its market");
+                } else if (hours - g_restoreObservedHours >= 1.0)
+                    CancelPlannedNpcBout("Saved NPC lineup unavailable after one game hour in Scratch");
+            }
+            if (g_restoredNpcPending) return;
+        }
         if (g_plannedNpc.valid && !ou->isPaused() && !PlannedNpcReady())
             CancelPlannedNpcBout("An announced fighter or arena is unavailable");
         if (!IsBusy())

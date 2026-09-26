@@ -318,8 +318,45 @@ namespace {
         if (d.pending.active && (d.status!=TownDiagnosticData::Active || !d.pending.sequence)) Fail(qp,"pending assignment requires an active run and nonzero sequence");
         if (d.counters.completed>d.config.target) Fail(Member(xp,"completed"),"completed fights exceed target");
     }
+    void PlannedNpc(const Value& v, PlannedNpcBout& bout) {
+        const std::string p="$.plannedNpc";
+        Object(v,p,"active|registryId|startHours|scoreA|scoreB|teamA|teamB|market|wagerPending|wagerSide|stake|payout");
+        bout.active=Bool(v,"active",p);
+        bout.registryId=Text(v,"registryId",p,bout.active);
+        bout.startHours=Number(v,"startHours",p,24000000.0);
+        bout.scoreA=Number(v,"scoreA",p,DBL_MAX);
+        bout.scoreB=Number(v,"scoreB",p,DBL_MAX);
+        const Value* sides[2]={&At(v,"teamA",p),&At(v,"teamB",p)};
+        std::vector<std::string>* teams[2]={&bout.teamA,&bout.teamB};
+        std::set<std::string> seen;
+        for(int side=0;side<2;++side) {
+            const std::string path=Member(p,side ? "teamB" : "teamA");
+            Array(*sides[side],path);
+            if(sides[side]->Size()>4 || (bout.active && sides[side]->Empty())) Fail(path,"expected 1 to 4 fighters");
+            for(rapidjson::SizeType i=0;i<sides[side]->Size();++i) {
+                const std::string row=Index(path,i);
+                const std::string id=String((*sides[side])[i],row,true);
+                Unique(seen,id,row); teams[side]->push_back(id);
+            }
+        }
+        bout.market=Bool(v,"market",p);
+        bout.wagerPending=Bool(v,"wagerPending",p);
+        bout.wagerSide=Int(v,"wagerSide",p,-1,1);
+        bout.stake=Int(v,"stake",p,0,INT_MAX/5);
+        bout.payout=Int(v,"payout",p,0,INT_MAX);
+        if(bout.active && (bout.startHours<=0 || bout.scoreA<=0 || bout.scoreB<=0))
+            Fail(p,"announced bout requires start time and positive scores");
+        if(bout.wagerPending && (!bout.active || !bout.market || bout.wagerSide<0 ||
+            bout.stake<=0 || bout.stake%PGConfig::kStakeStep || bout.payout<bout.stake ||
+            bout.payout>PGConfig::BookieCreditCeiling()))
+            Fail(p,"pending wager requires a valid announced market and payable frozen terms");
+        if(!bout.active && (!bout.registryId.empty() || bout.startHours || bout.scoreA || bout.scoreB ||
+            !bout.teamA.empty() || !bout.teamB.empty() || bout.market || bout.wagerPending ||
+            bout.wagerSide!=-1 || bout.stake || bout.payout)) Fail(p,"inactive bout must be empty");
+    }
     void Read(const Value& v, int sourceVersion, Snapshot& s) {
-        const char* const fields = sourceVersion >= 15 ?
+        const char* const fields = sourceVersion >= 16 ?
+            "version|saveKey|generation|playerStandings|townStandings|progression|factionUnlocks|challenges|diagnostic|bookieCredit|challengeCredit|plannedNpc" : sourceVersion >= 15 ?
             "version|saveKey|generation|playerStandings|townStandings|progression|factionUnlocks|challenges|diagnostic|bookieCredit|challengeCredit" :
             sourceVersion >= 12 ?
             "version|saveKey|generation|performanceProfile|performanceWelcomeSeen|playerStandings|townStandings|progression|factionUnlocks|challenges|diagnostic|bookieCredit|challengeCredit" :
@@ -355,6 +392,11 @@ namespace {
         // save's whole arena progression. The challenge credit ceiling is the
         // quote's own payout cap (TownChallengeBuyInPolicy::Quote::Valid).
         s.bookieCredit=Int(v,"bookieCredit","$",0,PGConfig::BookieCreditCeiling()); s.challengeCredit=Int(v,"challengeCredit","$",0,20000);
+        if(sourceVersion>=16) {
+            PlannedNpc(At(v,"plannedNpc","$"),s.plannedNpc);
+            if(s.plannedNpc.wagerPending && s.bookieCredit)
+                Fail("$.bookieCredit","a pending wager cannot coexist with a bookie credit");
+        }
     }
     void Str(Writer& w, const std::string& s) { w.String(s.c_str(),static_cast<rapidjson::SizeType>(s.size())); }
     void Text(Writer& w, const char* key, const std::string& s) { w.Key(key); Str(w,s); }
@@ -416,7 +458,16 @@ namespace {
         History(w,"playerHistory",c.playerHistory); History(w,"ambientHistory",c.ambientHistory);
         w.Key("offers"); w.StartArray(); for (int i=0; i<5; ++i) Offer(w,c.offers[i]); w.EndArray(); w.Key("skarnOffer"); Offer(w,c.skarnOffer);
         Bool(w,"skarnGenerated",c.skarnGenerated); Bool(w,"skarnWon",c.skarnWon); Bool(w,"skarnAttempted",c.skarnAttempted); Bool(w,"skarnInProgress",c.skarnInProgress); Number(w,"skarnLastEnd",c.skarnLastEnd,"$.challenges.skarnLastEnd"); Number(w,"lastChallengeEndHours",c.lastChallengeEndHours,"$.challenges.lastChallengeEndHours"); Bool(w,"hasChallengeEnd",c.hasChallengeEnd); Int(w,"paidRefreshCount",c.paidRefreshCount); Uint(w,"paidRefreshNonce",c.paidRefreshNonce); w.EndObject();
-        Diagnostic(w,s.diagnostic); Int(w,"bookieCredit",s.bookieCredit); Int(w,"challengeCredit",s.challengeCredit); w.EndObject();
+        Diagnostic(w,s.diagnostic); Int(w,"bookieCredit",s.bookieCredit); Int(w,"challengeCredit",s.challengeCredit);
+        const PlannedNpcBout& b=s.plannedNpc;
+        w.Key("plannedNpc"); w.StartObject(); Bool(w,"active",b.active); Text(w,"registryId",b.registryId);
+        Number(w,"startHours",b.startHours,"$.plannedNpc.startHours");
+        Number(w,"scoreA",b.scoreA,"$.plannedNpc.scoreA"); Number(w,"scoreB",b.scoreB,"$.plannedNpc.scoreB");
+        w.Key("teamA"); w.StartArray(); for(size_t i=0;i<b.teamA.size();++i) Str(w,b.teamA[i]); w.EndArray();
+        w.Key("teamB"); w.StartArray(); for(size_t i=0;i<b.teamB.size();++i) Str(w,b.teamB[i]); w.EndArray();
+        Bool(w,"market",b.market); Bool(w,"wagerPending",b.wagerPending);
+        Int(w,"wagerSide",b.wagerSide); Int(w,"stake",b.stake); Int(w,"payout",b.payout);
+        w.EndObject(); w.EndObject();
     }
 }
 LoadResult DecodeSnapshot(const std::string& json) {
@@ -436,14 +487,14 @@ LoadResult DecodeSnapshot(const std::string& json) {
         if (!doc.IsObject()) Fail("$","expected a snapshot object");
         const int version=Int(doc,"version","$",0,INT_MAX);
         if (version<11) { result.code=LegacyReset; result.field="$.version"; result.message="legacy arena progression must reset; preserve the original sidecar"; return result; }
-        if (version>15) { result.code=UnsupportedVersion; result.field="$.version"; result.message="snapshot schema is newer than supported version 15"; return result; }
+        if (version>16) { result.code=UnsupportedVersion; result.field="$.version"; result.message="snapshot schema is newer than supported version 16"; return result; }
         Snapshot parsed; Read(doc,version,parsed); result.snapshot=parsed; result.code=Ready;
     } catch (const Failure& f) { result.code=f.code; result.field=f.field; result.message=f.message; }
     return result;
 }
 bool EncodeSnapshot(const Snapshot& value, std::string& json, std::string& error) {
     try {
-        if (value.version!=15) Fail("$.version","only schema version 15 can be written");
+        if (value.version!=16) Fail("$.version","only schema version 16 can be written");
         rapidjson::StringBuffer buffer; Writer writer(buffer); Write(writer,value);
         std::string encoded(buffer.GetString(),buffer.GetSize()); encoded += '\n';
         // One validation contract for edited files and runtime snapshots. Never

@@ -142,6 +142,28 @@ namespace
         ArenaRewards::GeneralBoneSetterBraces
     };
 
+    // UI order only: Piece enum values are persisted progression keys.
+    const ArenaRewards::Piece kArmourDisplayOrder[] =
+    {
+        ArenaRewards::PiecePitfighterFootwraps,
+        ArenaRewards::PiecePitfighterPants,
+        ArenaRewards::PiecePitfighterHarness,
+        ArenaRewards::PiecePitfighterJawGuard,
+        ArenaRewards::PieceRetainerBoots,
+        ArenaRewards::PieceRetainerPants,
+        ArenaRewards::PieceRetainerJacket,
+        ArenaRewards::PieceRetainerHelmet,
+        ArenaRewards::PieceEnforcerBoots,
+        ArenaRewards::PieceEnforcerLegplates,
+        ArenaRewards::PieceEnforcerChest,
+        ArenaRewards::PieceEnforcerHelmet,
+        ArenaRewards::PiecePlateBoots,
+        ArenaRewards::PiecePlateSkirt,
+        ArenaRewards::PiecePlateArmour,
+        ArenaRewards::PieceCloak,
+        ArenaRewards::PieceHelmet
+    };
+
     int Max(int a, int b) { return a > b ? a : b; }
     int Min(int a, int b) { return a < b ? a : b; }
     int BodyHeight() { return Max(1, Max(g_title->getFontHeight(), g_title->getTextSize().height)); }
@@ -200,13 +222,13 @@ namespace
         switch (row)
         {
         case ArenaRewards::ArmourRowPitfighter:
-            return "Footwraps / Harness / Jaw Guard / Pants";
+            return "Footwraps / Pants / Harness / Jaw Guard";
         case ArenaRewards::ArmourRowRetainer:
-            return "Pants / Jacket / Boots / Helmet";
+            return "Boots / Pants / Jacket / Helmet";
         case ArenaRewards::ArmourRowEnforcer:
-            return "Legplates / Plated Boots / Chest / Helmet";
+            return "Plated Boots / Legplates / Chest / Helmet";
         case ArenaRewards::ArmourRowWarlord:
-            return "Cloak / Plateskirt / Plate Boots / Armour / Helmet";
+            return "Plate Boots / Plateskirt / Armour / Cloak / Helmet";
         default:
             return "";
         }
@@ -620,21 +642,33 @@ namespace
         const bool weapon = ArenaRewards::IsWeapon(card.piece);
         const int imageHeight = Min(height - actionHeight - 3 * gap,
             Max(body * 5, weapon ? height * 3 / 4 : height / 2));
+        const bool chest = card.piece == ArenaRewards::PiecePitfighterHarness ||
+            card.piece == ArenaRewards::PieceRetainerJacket ||
+            card.piece == ArenaRewards::PieceEnforcerChest ||
+            card.piece == ArenaRewards::PiecePlateArmour;
+        const bool boots = card.piece == ArenaRewards::PieceRetainerBoots ||
+            card.piece == ArenaRewards::PieceEnforcerBoots ||
+            card.piece == ArenaRewards::PiecePlateBoots;
+        const int armourIconSize = chest ? imageHeight * 5 / 4 :
+            (boots ? imageHeight * 7 / 8 : imageHeight);
         const int imageWidth = weapon
-            ? Min(width * 45 / 100, imageHeight * 2)
-            : imageHeight;
+            ? Min(width * 45 / 100, imageHeight * 7 / 2)
+            : armourIconSize;
         const int actionWidth = Min(width,
             card.claim->getTextSize().width + 4 * gap);
         const int contentLeft = left + 2 * gap;
         const int contentTop = top + gap;
-        const int textX = contentLeft + imageWidth + gap;
+        const int textX = contentLeft +
+            (weapon ? imageWidth : Max(imageHeight, imageWidth)) + gap;
         const int textWidth = Max(1, left + width - gap - textX);
         int textBottom = contentTop + WrappedHeight(
             card.name, textX, contentTop, textWidth);
         textBottom += gap + WrappedHeight(
             card.progress, textX, textBottom + gap, textWidth);
         card.iconArea = MyGUI::IntCoord(
-            contentLeft, contentTop, imageWidth, Max(1, imageHeight));
+            contentLeft + (boots ? (imageHeight - imageWidth) / 2 : 0),
+            contentTop + (boots ? (imageHeight - armourIconSize) / 2 : 0),
+            imageWidth, Max(1, weapon ? imageHeight : armourIconSize));
         LayoutIcon(card);
         card.claim->setCoord(
             left + width - actionWidth - gap,
@@ -780,9 +814,10 @@ namespace
                         y += actionHeight + 2 * gap;
                         const int iconSize = Max(32, body * 2);
                         int iconX = gap;
-                        for (int i = 0; i < ArenaRewards::PieceCount; ++i)
+                        for (size_t i = 0; i < sizeof(kArmourDisplayOrder) /
+                            sizeof(kArmourDisplayOrder[0]); ++i)
                         {
-                            RewardCard& manifest = g_cards[i];
+                            RewardCard& manifest = g_cards[kArmourDisplayOrder[i]];
                             if (ArenaRewards::IsWeapon(manifest.piece) ||
                                 ArenaRewards::RowFor(manifest.piece) !=
                                     armourRow)
@@ -801,9 +836,10 @@ namespace
                         (width - (columns - 1) * gap) / columns);
                     const int cardHeight = Max(body * 8, 120);
                     int visibleIndex = 0;
-                    for (int i = 0; i < ArenaRewards::PieceCount; ++i)
+                    for (size_t i = 0; i < sizeof(kArmourDisplayOrder) /
+                        sizeof(kArmourDisplayOrder[0]); ++i)
                     {
-                        RewardCard& card = g_cards[i];
+                        RewardCard& card = g_cards[kArmourDisplayOrder[i]];
                         if (!card.visible ||
                             ArenaRewards::RowFor(card.piece) != armourRow)
                             continue;
@@ -843,10 +879,12 @@ namespace
                     width, body * 20, gap, 2);
                 const int cellWidth = Max(1,
                     (width - (columns - 1) * gap) / columns);
+                const int minimumCardHeight = Max(body * 7,
+                    NativeUI::RowHeight(g_cards[0].claim, 0) + body * 3 + 4 * gap);
                 const int cardHeight = columns == 2
-                    ? RewardsLayout::CompactRowHeight(
+                    ? Max(minimumCardHeight, RewardsLayout::CompactRowHeight(
                         RewardsLayout::FillRowHeight(
-                            view.height, 2, gap, body * 9), body * 9)
+                            view.height, 2, gap, body * 9), body * 9) * 3 / 4)
                     : Max(body * 9, 140);
                 int visibleIndex = 0;
                 for (int i = 0; i < ArenaRewards::PieceCount; ++i)

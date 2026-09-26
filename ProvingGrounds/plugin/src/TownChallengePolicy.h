@@ -134,11 +134,17 @@ namespace TownChallengePolicy
         Card() : seed(1), ambientSeed(2463534242u), division(0), milestones(0), uniqueWins(0), challengeWins(0), skarnGenerated(false), skarnWon(false),
             skarnAttempted(false), skarnInProgress(false), skarnLastEnd(0.0), lastChallengeEndHours(0.0), hasChallengeEnd(false), paidRefreshCount(0), paidRefreshNonce(1) {}
     };
-    inline bool ChallengeCooldownActive(const Card& card, double now, int cooldownHours)
+    inline bool ChallengeCooldownActive(const Card& card, const Offer& offer, double now, int cooldownHours)
     {
-        return cooldownHours > 0 && card.hasChallengeEnd &&
-            now >= card.lastChallengeEndHours &&
-            now - card.lastChallengeEndHours < cooldownHours;
+        return offer.encounter == EncounterSkarn && cooldownHours > 0 && card.skarnAttempted &&
+            now >= card.skarnLastEnd &&
+            now - card.skarnLastEnd < cooldownHours;
+    }
+    inline void RecordSkarnChallengeEnd(Card& card, const Offer& offer, double now)
+    {
+        if (offer.encounter != EncounterSkarn || !(now >= 0.0) || now > 24000000.0) return;
+        card.skarnAttempted = true;
+        card.skarnLastEnd = now;
     }
     inline Offer& At(Card& card, int slot) { return slot == 5 ? card.skarnOffer : card.offers[slot]; }
     inline void RecordVictory(Card& card, bool challenge, bool won, unsigned defeated)
